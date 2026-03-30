@@ -57,8 +57,16 @@ class MicTray:
         self.muted = is_muted(self.volume)
         self.icon = None
 
+    def _reconnect(self):
+        """Reconecta al micrófono si la referencia COM se perdió."""
+        self.volume = get_mic_volume()
+
     def toggle(self, icon=None, item=None):
-        self.muted = toggle_mute(self.volume)
+        try:
+            self.muted = toggle_mute(self.volume)
+        except Exception:
+            self._reconnect()
+            self.muted = toggle_mute(self.volume)
         self._update()
 
     def _update(self):
