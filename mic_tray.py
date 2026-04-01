@@ -1,16 +1,15 @@
 """
-mic_tray.py — Toggle de micrófono en la bandeja del sistema de Windows.
-Requiere: pip install pystray pillow pycaw
+mic_tray.py — Toggle de micrófono en la barra de tareas de Windows.
+Requiere: pip install pycaw
 """
 
-import pystray
-from PIL import Image, ImageDraw
+import ctypes
+import tkinter as tk
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
 
 def get_mic_volume():
-    """Obtiene la interfaz IAudioEndpointVolume del micrófono por defecto."""
     devices = AudioUtilities.GetMicrophone()
     if devices is None:
         raise RuntimeError("No se encontró micrófono por defecto")
@@ -18,92 +17,119 @@ def get_mic_volume():
     return interface.QueryInterface(IAudioEndpointVolume)
 
 
-def is_muted(volume):
-    """Retorna True si el mic está muteado."""
-    return bool(volume.GetMute())
+def get_taskbar_rect():
+    """Obtiene posición y tamaño de la barra de tareas."""
+    from ctypes import wintypes
+    class APPBARDATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uCallbackMessage", wintypes.UINT),
+            ("uEdge", wintypes.UINT),
+            ("rc", wintypes.RECT),
+            ("lParam", wintypes.LPARAM),
+        ]
+    abd = APPBARDATA()
+    abd.cbSize = ctypes.sizeof(APPBARDATA)
+    ctypes.windll.shell32.SHAppBarMessage(5, ctypes.byref(abd))  # ABM_GETTASKBARPOS
+    return abd.rc
 
 
-def toggle_mute(volume):
-    """Cambia el estado de mute del mic. Retorna el nuevo estado."""
-    current = volume.GetMute()
-    volume.SetMute(not current, None)
-    return not current
+class MicToggle:
+    TASKBAR_BG = "#1f1f1f"
+    COLOR_ACTIVE = "#28be5c"
+    COLOR_MUTED = "#dc3232"
+    ICON_SIZE = 32
+    PADDING = 4
 
-
-def make_icon(muted):
-    """Crea el ícono: verde = activo, rojo con línea = muteado."""
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    color = (220, 50, 50, 255) if muted else (40, 190, 100, 255)
-    draw.ellipse([4, 4, 60, 60], fill=color)
-
-    # Micrófono
-    draw.rectangle([26, 14, 38, 36], fill=(255, 255, 255, 220), outline=(255, 255, 255))
-    draw.arc([20, 28, 44, 48], 0, 180, fill=(255, 255, 255, 220), width=3)
-    draw.line([32, 48, 32, 54], fill=(255, 255, 255, 220), width=3)
-    draw.line([24, 54, 40, 54], fill=(255, 255, 255, 220), width=3)
-
-    if muted:
-        draw.line([14, 14, 50, 50], fill=(255, 255, 100, 255), width=4)
-
-    return img
-
-
-class MicTray:
     def __init__(self):
         self.volume = get_mic_volume()
-        self.muted = is_muted(self.volume)
-        self.icon = None
+        self.muted = bool(self.volume.GetMute())
 
-    def _reconnect(self):
-        """Reconecta al micrófono si la referencia COM se perdió."""
-        self.volume = get_mic_volume()
+        self.root = tk.Tk()
+        self.root.title("Mic")
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-toolwindow", True)
+        self.root.configure(bg=self.TASKBAR_BG)
 
-    def toggle(self, icon=None, item=None):
-        try:
-            self.muted = toggle_mute(self.volume)
-        except Exception:
-            self._reconnect()
-            self.muted = toggle_mute(self.volume)
-        self._update()
+        # Tamaño del widget = icono + padding
+        w = self.ICON_SIZE + self.PADDING * 2
+        taskbar = get_taskbar_rect()
+        taskbar_h = taskbar.bottom - taskbar.top
 
-    def _update(self):
-        if self.icon:
-            self.icon.icon = make_icon(self.muted)
-            estado = "Muteado" if self.muted else "Activo"
-            self.icon.title = f"Mic — {estado}"
-            self.icon.menu = self._menu()
+        # Centrar verticalmente en la barra de tareas
+        x = taskbar.right - w - 200  # a la izquierda del systray
+        y = taskbar.top + (taskbar_h - taskbar_h) // 2
+        h = taskbar_h
 
-    def _menu(self):
-        estado = "Mic muteado" if self.muted else "Mic activo"
-        accion = "Activar mic" if self.muted else "Mutear mic"
-        return pystray.Menu(
-            pystray.MenuItem(estado, None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(accion, self.toggle),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Salir", lambda icon, item: icon.stop()),
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+        self.canvas = tk.Canvas(
+            self.root, width=w, height=h,
+            highlightthickness=0, cursor="hand2", bg=self.TASKBAR_BG,
         )
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._on_click)
+
+        # Drag para reposicionar en la barra
+        self._drag_data = {}
+        self.canvas.bind("<Button-3>", self._start_drag)
+        self.canvas.bind("<B3-Motion>", self._do_drag)
+
+        self._draw()
+
+    def _draw(self):
+        self.canvas.delete("all")
+        color = self.COLOR_MUTED if self.muted else self.COLOR_ACTIVE
+        w = self.ICON_SIZE + self.PADDING * 2
+        h = int(self.root.geometry().split("x")[1].split("+")[0])
+        # Centrar el círculo verticalmente
+        cx = w // 2
+        cy = h // 2
+        r = self.ICON_SIZE // 2
+        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="")
+        # Micrófono
+        self.canvas.create_rectangle(cx - 4, cy - 10, cx + 4, cy - 1, fill="white", outline="")
+        self.canvas.create_arc(cx - 7, cy - 6, cx + 7, cy + 4, start=180, extent=180,
+                               outline="white", width=2, style="arc")
+        self.canvas.create_line(cx, cy + 4, cx, cy + 7, fill="white", width=2)
+        self.canvas.create_line(cx - 4, cy + 7, cx + 4, cy + 7, fill="white", width=2)
+        # Tachado si muteado
+        if self.muted:
+            self.canvas.create_line(cx - r + 4, cy - r + 4, cx + r - 4, cy + r - 4,
+                                    fill="#ffff64", width=2)
+
+    def _on_click(self, event):
+        try:
+            current = self.volume.GetMute()
+            self.volume.SetMute(not current, None)
+            self.muted = not current
+        except Exception:
+            self.volume = get_mic_volume()
+            current = self.volume.GetMute()
+            self.volume.SetMute(not current, None)
+            self.muted = not current
+        self._draw()
+
+    def _start_drag(self, event):
+        self._drag_data = {"x": event.x}
+
+    def _do_drag(self, event):
+        dx = event.x - self._drag_data["x"]
+        x = self.root.winfo_x() + dx
+        y = self.root.winfo_y()
+        self.root.geometry(f"+{x}+{y}")
 
     def run(self):
-        self.icon = pystray.Icon(
-            "mic_tray",
-            make_icon(self.muted),
-            f"Mic — {'Muteado' if self.muted else 'Activo'}",
-            menu=self._menu(),
-        )
-        self.icon.default_action = self.toggle
-        self.icon.run()
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
     try:
-        print("Iniciando MicTray...")
-        app = MicTray()
-        print(f"Mic detectado. Estado: {'MUTEADO' if app.muted else 'ACTIVO'}")
-        print("Icono en la bandeja. Click izquierdo = toggle, derecho = menu.")
+        app = MicToggle()
+        print(f"Mic: {'MUTEADO' if app.muted else 'ACTIVO'}")
+        print("Click izquierdo = toggle | Click derecho + arrastrar = mover")
         app.run()
     except Exception as e:
         print(f"ERROR: {e}")
