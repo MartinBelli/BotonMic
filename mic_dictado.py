@@ -17,13 +17,13 @@ import sys
 import tempfile
 import threading
 import time
-import wave
 import tkinter as tk
 from ctypes import wintypes
 
 import numpy as np
 import sounddevice as sd
 from comtypes import CLSCTX_ALL
+from faster_whisper import WhisperModel
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
 # ── Hotkey global: Ctrl+Shift+F11 ──────────────────────────────
@@ -36,6 +36,14 @@ HOTKEY_ID = 2  # distinto al de MicToggle (que usa 1)
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
+
+# ── Modelo de transcripcion ──────────────────────────────────────
+MODEL_NAME = "small"  # ~470 MB descargado, decente en español
+MODEL_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+    "MicDictado", "models",
+)
+MODEL_LANG = "es"
 
 # ── Single-instance: kill + replace via lockfile con PID ────────
 # Si ya hay una instancia corriendo, la matamos y nos quedamos con la nueva.
@@ -234,9 +242,33 @@ class MicDictado:
         self._current_level = 0.0
         self.overlay.bind_level_source(lambda: self._current_level)
 
+        # Modelo Whisper: carga en hilo daemon para no bloquear el arranque de Tk.
+        # La primera vez descarga ~470 MB a MODEL_DIR. Luego queda cacheado.
+        self.model = None
+        self._model_ready = False
+        self.overlay.set_state("cargando")
+        threading.Thread(target=self._load_model, daemon=True).start()
+
         # Hotkey en hilo daemon (mismo patron que mic_tray.py:103-109)
         self._hotkey_thread = threading.Thread(target=self._listen_hotkey, daemon=True)
         self._hotkey_thread.start()
+
+    def _load_model(self):
+        try:
+            os.makedirs(MODEL_DIR, exist_ok=True)
+            print(f"[MicDictado] cargando modelo '{MODEL_NAME}' en {MODEL_DIR}...")
+            t0 = time.time()
+            self.model = WhisperModel(
+                MODEL_NAME, device="cpu", compute_type="int8",
+                download_root=MODEL_DIR,
+            )
+            self._model_ready = True
+            print(f"[MicDictado] modelo listo en {time.time() - t0:.1f}s")
+            self.overlay.root.after(0, self.overlay.set_state, "idle")
+        except Exception as e:
+            print(f"[MicDictado] error cargando modelo: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _com_call(self, accion):
         """Ejecuta accion(self.volume) con retry tras fallo de COM.
@@ -258,7 +290,11 @@ class MicDictado:
                 self.overlay.root.after(0, self._toggle)
 
     def _toggle(self):
-        """Alterna grabacion."""
+        """Alterna grabacion. Si el modelo aun no esta cargado, ignora el disparo."""
+        if not self._model_ready:
+            print("[MicDictado] modelo aun cargando, ignorando disparo")
+            self.overlay.set_state("cargando")
+            return
         if self.grabando:
             self._stop_recording()
         else:
@@ -320,7 +356,7 @@ class MicDictado:
             self.grabando = False
 
     def _procesar_audio(self):
-        """En fase 2: guarda WAV temporal para inspeccion manual."""
+        """Transcribe el buffer capturado con faster-whisper y lo imprime."""
         self.overlay.root.after(0, self.overlay.set_state, "transcribiendo")
         try:
             with self._buffer_lock:
@@ -331,20 +367,26 @@ class MicDictado:
                 print("[MicDictado] buffer vacio, nada que hacer")
                 return
 
-            audio_int16 = np.concatenate(chunks, axis=0)
+            # int16 [N, 1] -> float32 [N] normalizado a [-1, 1], que es lo que espera Whisper
+            audio_int16 = np.concatenate(chunks, axis=0).squeeze()
             duracion = len(audio_int16) / SAMPLE_RATE
+            audio_f32 = audio_int16.astype(np.float32) / 32768.0
 
-            # Guardar WAV temporal (fase 2 solo inspeccion)
-            tmp_dir = os.path.join(tempfile.gettempdir(), "MicDictado")
-            os.makedirs(tmp_dir, exist_ok=True)
-            wav_path = os.path.join(tmp_dir, f"dictado_{int(time.time())}.wav")
-            with wave.open(wav_path, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2)  # int16 = 2 bytes
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(audio_int16.tobytes())
+            if duracion < 0.3:
+                print(f"[MicDictado] audio muy corto ({duracion:.2f}s), descartando")
+                return
 
-            print(f"[MicDictado] duracion: {duracion:.2f}s | WAV: {wav_path}")
+            print(f"[MicDictado] transcribiendo {duracion:.2f}s de audio...")
+            t0 = time.time()
+            segments, info = self.model.transcribe(
+                audio_f32,
+                language=MODEL_LANG,
+                beam_size=5,
+            )
+            # segments es un generator; consumirlo materializa la transcripcion
+            texto = " ".join(seg.text.strip() for seg in segments).strip()
+            elapsed = time.time() - t0
+            print(f"[MicDictado] transcripcion ({elapsed:.1f}s): {texto!r}")
         except Exception as e:
             print(f"[MicDictado] error procesando audio: {e}")
             import traceback
