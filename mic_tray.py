@@ -245,6 +245,12 @@ class MicToggle:
         y = taskbar.top
         h = taskbar_h
 
+        # Guardamos dimensiones como atributos: no leer self.root.geometry() en _draw
+        # porque Tk puede no haber aplicado la geometry aun al primer dibujo,
+        # devolviendo "1x1+0+0" y rompiendo el layout hasta el primer redraw.
+        self._widget_w = w
+        self._widget_h = h
+
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
         self.canvas = tk.Canvas(
@@ -291,8 +297,8 @@ class MicToggle:
 
     def _draw(self):
         self.canvas.delete("all")
-        w = self.ICON_SIZE + self.HALO_MARGIN * 2
-        h = int(self.root.geometry().split("x")[1].split("+")[0])
+        w = self._widget_w
+        h = self._widget_h
         cx = w // 2
         cy = h // 2
         r = self.ICON_SIZE // 2
