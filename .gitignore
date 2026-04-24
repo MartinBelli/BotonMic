@@ -2,6 +2,5 @@ __pycache__/
 *.pyc
 build/
 dist/
-*.spec
 *.egg-info/
 .env
