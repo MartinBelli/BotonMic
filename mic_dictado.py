@@ -10,10 +10,17 @@ Requiere: pip install -r requirements.txt
 """
 
 import ctypes
+import os
 import sys
+import tempfile
 import threading
+import time
+import wave
 import tkinter as tk
 from ctypes import wintypes
+
+import numpy as np
+import sounddevice as sd
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
@@ -22,6 +29,11 @@ MOD_CTRL = 0x0002
 MOD_SHIFT = 0x0004
 VK_F11 = 0x7A
 HOTKEY_ID = 2  # distinto al de MicToggle (que usa 1)
+
+# ── Captura de audio ─────────────────────────────────────────────
+SAMPLE_RATE = 16000
+CHANNELS = 1
+DTYPE = "int16"
 
 # ── Mutex: impedir multiples instancias ──────────────────────────
 _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "Global\\MicDictadoMutex")
@@ -107,9 +119,25 @@ class MicDictado:
         self.overlay = DictadoOverlay()
         self.grabando = False
 
+        # COM del microfono
+        self.volume = get_mic_volume()
+        self._mute_previo = None
+        self._audio_buffer = []
+        self._buffer_lock = threading.Lock()
+        self._stream = None
+
         # Hotkey en hilo daemon (mismo patron que mic_tray.py:103-109)
         self._hotkey_thread = threading.Thread(target=self._listen_hotkey, daemon=True)
         self._hotkey_thread.start()
+
+    def _com_call(self, accion):
+        """Ejecuta accion(self.volume) con retry tras fallo de COM.
+        Mismo patron que mic_tray.py:132-142 para sobrevivir a sleep/USB reconnect."""
+        try:
+            return accion(self.volume)
+        except Exception:
+            self.volume = get_mic_volume()
+            return accion(self.volume)
 
     def _listen_hotkey(self):
         """Escucha Ctrl+Shift+F11 via RegisterHotKey."""
@@ -122,15 +150,98 @@ class MicDictado:
                 self.overlay.root.after(0, self._toggle)
 
     def _toggle(self):
-        """Alterna grabacion. En Fase 1 solo cambia estado visual."""
+        """Alterna grabacion."""
         if self.grabando:
-            self.grabando = False
-            self.overlay.set_state("idle")
-            print("[MicDictado] stop (fase 1: sin audio todavia)")
+            self._stop_recording()
         else:
+            self._start_recording()
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        """Callback de sounddevice: appendea chunk int16 al buffer."""
+        if status:
+            print(f"[audio] status: {status}")
+        with self._buffer_lock:
+            self._audio_buffer.append(indata.copy())
+
+    def _start_recording(self):
+        try:
+            # Guardar estado mute y desmutear si hace falta
+            self._mute_previo = bool(self._com_call(lambda v: v.GetMute()))
+            if self._mute_previo:
+                self._com_call(lambda v: v.SetMute(False, None))
+
+            # Buffer limpio y abrir stream
+            with self._buffer_lock:
+                self._audio_buffer = []
+
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+
             self.grabando = True
             self.overlay.set_state("grabando")
-            print("[MicDictado] start (fase 1: sin audio todavia)")
+            print("[MicDictado] grabando...")
+        except Exception as e:
+            print(f"[MicDictado] error al iniciar grabacion: {e}")
+            self.overlay.set_state("idle")
+
+    def _stop_recording(self):
+        try:
+            # Cerrar stream
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+                self._stream = None
+
+            # Procesar buffer en hilo separado para no bloquear Tk
+            threading.Thread(target=self._procesar_audio, daemon=True).start()
+        except Exception as e:
+            print(f"[MicDictado] error al detener grabacion: {e}")
+        finally:
+            self.grabando = False
+
+    def _procesar_audio(self):
+        """En fase 2: guarda WAV temporal para inspeccion manual."""
+        self.overlay.root.after(0, self.overlay.set_state, "transcribiendo")
+        try:
+            with self._buffer_lock:
+                chunks = list(self._audio_buffer)
+                self._audio_buffer = []
+
+            if not chunks:
+                print("[MicDictado] buffer vacio, nada que hacer")
+                return
+
+            audio_int16 = np.concatenate(chunks, axis=0)
+            duracion = len(audio_int16) / SAMPLE_RATE
+
+            # Guardar WAV temporal (fase 2 solo inspeccion)
+            tmp_dir = os.path.join(tempfile.gettempdir(), "MicDictado")
+            os.makedirs(tmp_dir, exist_ok=True)
+            wav_path = os.path.join(tmp_dir, f"dictado_{int(time.time())}.wav")
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)  # int16 = 2 bytes
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_int16.tobytes())
+
+            print(f"[MicDictado] duracion: {duracion:.2f}s | WAV: {wav_path}")
+        except Exception as e:
+            print(f"[MicDictado] error procesando audio: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Restaurar mute al estado previo
+            try:
+                if self._mute_previo:
+                    self._com_call(lambda v: v.SetMute(True, None))
+            except Exception as e:
+                print(f"[MicDictado] error restaurando mute: {e}")
+            self.overlay.root.after(0, self.overlay.set_state, "idle")
 
     def run(self):
         self.overlay.root.mainloop()
