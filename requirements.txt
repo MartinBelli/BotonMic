@@ -1,0 +1,6 @@
+pycaw
+comtypes
+sounddevice
+numpy
+faster-whisper
+pyperclip
