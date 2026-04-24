@@ -21,7 +21,6 @@ import tkinter as tk
 from ctypes import wintypes
 
 import numpy as np
-import pyperclip
 import sounddevice as sd
 from comtypes import CLSCTX_ALL
 from faster_whisper import WhisperModel
@@ -98,48 +97,107 @@ def get_mic_volume():
     return interface.QueryInterface(IAudioEndpointVolume)
 
 
-# ── Pegado de texto: clipboard + Ctrl+V via keybd_event ──────────
-# keybd_event es legacy pero confiable en Win10/11. Usamos Ctrl+V en lugar de
-# tipear con pyautogui porque es mucho mas rapido y funciona con acentos/ñ en
-# todas las apps (Chrome, VSCode, terminales, Notion, etc).
-_VK_CONTROL = 0x11
-_VK_V = 0x56
+# ── Tipeo Unicode via SendInput ─────────────────────────────────
+# Usamos SendInput con KEYEVENTF_UNICODE para "tipear" el texto caracter por
+# caracter. Funciona en cualquier app que acepte teclado: editores normales,
+# terminales (cmd/PowerShell/Windows Terminal), terminales integradas de
+# Cursor/VSCode (Electron), navegadores, etc. No toca el clipboard.
+#
+# Decision tomada despues de probar el approach previo (clipboard + Ctrl+V):
+# en terminales el atajo es Ctrl+Shift+V y no podiamos detectar de forma
+# robusta cuando estamos en terminal vs editor (Electron no expone el control
+# interno a Win32). El tipeo Unicode resuelve eso universalmente.
+
+_INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
 
 
-def paste_text(texto):
-    """Copia texto al clipboard, simula Ctrl+V, y restaura el clipboard previo."""
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_ushort),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("ki", _KEYBDINPUT),
+        ("mi", _MOUSEINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("union", _INPUT_UNION),
+    ]
+
+
+def type_text_unicode(texto, batch_size=20, batch_delay=0.005):
+    """Tipea texto caracter por caracter con SendInput KEYEVENTF_UNICODE.
+
+    batch_size + batch_delay para no abrumar apps que procesan input lento.
+    """
     if not texto:
         return
-    try:
-        clipboard_prev = pyperclip.paste()
-    except Exception:
-        clipboard_prev = None
 
-    try:
-        pyperclip.copy(texto)
-    except Exception as e:
-        print(f"[MicDictado] error copiando al clipboard: {e}")
+    inputs = []
+    for ch in texto:
+        code = ord(ch)
+        if code > 0xFFFF:
+            # Caracteres fuera del BMP (emoji, etc.) requieren surrogate pairs.
+            # Para texto en español no aplica; los descartamos por simplicidad.
+            continue
+        # Key down
+        inp_d = _INPUT()
+        inp_d.type = _INPUT_KEYBOARD
+        inp_d.union.ki = _KEYBDINPUT(0, code, _KEYEVENTF_UNICODE, 0, None)
+        inputs.append(inp_d)
+        # Key up
+        inp_u = _INPUT()
+        inp_u.type = _INPUT_KEYBOARD
+        inp_u.union.ki = _KEYBDINPUT(
+            0, code, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP, 0, None
+        )
+        inputs.append(inp_u)
+
+    if not inputs:
         return
 
-    # Pequeño delay para que el clipboard se estabilice antes de Ctrl+V
-    time.sleep(0.05)
-
     user32 = ctypes.windll.user32
-    user32.keybd_event(_VK_CONTROL, 0, 0, 0)                # Ctrl down
-    user32.keybd_event(_VK_V, 0, 0, 0)                      # V down
-    user32.keybd_event(_VK_V, 0, _KEYEVENTF_KEYUP, 0)       # V up
-    user32.keybd_event(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0) # Ctrl up
-
-    # Restaurar clipboard previo con delay: algunas apps leen el clipboard
-    # de forma asincrona en el WM_PASTE (ej. VSCode), por eso esperamos.
-    if clipboard_prev is not None:
-        def _restore():
-            try:
-                pyperclip.copy(clipboard_prev)
-            except Exception:
-                pass
-        threading.Timer(0.3, _restore).start()
+    sizeof_input = ctypes.sizeof(_INPUT)
+    # Cada caracter genera 2 eventos (down + up). batch_size es chars.
+    step = batch_size * 2
+    for i in range(0, len(inputs), step):
+        batch = inputs[i:i + step]
+        arr = (_INPUT * len(batch))(*batch)
+        user32.SendInput(len(batch), arr, sizeof_input)
+        if i + step < len(inputs):
+            time.sleep(batch_delay)
 
 
 class DictadoOverlay:
@@ -442,9 +500,10 @@ class MicDictado:
             elapsed = time.time() - t0
             print(f"[MicDictado] transcripcion ({elapsed:.1f}s): {texto!r}")
 
-            # Pegar donde esta el cursor (preservando clipboard previo)
+            # Tipear el texto donde esta el cursor (Unicode via SendInput,
+            # funciona en cualquier app incluyendo terminales)
             if texto:
-                paste_text(texto)
+                type_text_unicode(texto)
         except Exception as e:
             print(f"[MicDictado] error procesando audio: {e}")
             import traceback
