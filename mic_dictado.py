@@ -393,6 +393,15 @@ class MicDictado:
                 self._stream.close()
                 self._stream = None
 
+            # Restaurar mute YA, antes de transcribir. La transcripcion no necesita
+            # el mic abierto y el usuario espera que el mic vuelva a su estado
+            # apenas suelta el hotkey (no quiere quedar abierto 3-5s durante el STT).
+            try:
+                if self._mute_previo:
+                    self._com_call(lambda v: v.SetMute(True, None))
+            except Exception as e:
+                print(f"[MicDictado] error restaurando mute: {e}")
+
             # Procesar buffer en hilo separado para no bloquear Tk
             threading.Thread(target=self._procesar_audio, daemon=True).start()
         except Exception as e:
@@ -441,12 +450,8 @@ class MicDictado:
             import traceback
             traceback.print_exc()
         finally:
-            # Restaurar mute al estado previo
-            try:
-                if self._mute_previo:
-                    self._com_call(lambda v: v.SetMute(True, None))
-            except Exception as e:
-                print(f"[MicDictado] error restaurando mute: {e}")
+            # El mute ya fue restaurado en _stop_recording, antes de empezar a
+            # transcribir, para que el remute sea inmediato al soltar el hotkey.
             self.overlay.root.after(0, self.overlay.set_state, "idle")
 
     def run(self):
