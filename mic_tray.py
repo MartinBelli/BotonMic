@@ -63,21 +63,29 @@ def get_taskbar_rect():
 
 class MicToggle:
     TASKBAR_BG = "#1f1f1f"
-    COLOR_ACTIVE = "#28be5c"
-    COLOR_MUTED = "#dc3232"
-    COLOR_METER_BG = "#2a2a2a"
-    COLOR_METER_LOW = "#3a3a3a"
-    COLOR_METER_OK = "#28be5c"
-    COLOR_METER_HIGH = "#f0c020"
-    COLOR_METER_PEAK = "#dc3232"
+    COLOR_ACTIVE = "#30d158"         # verde estilo iOS
+    COLOR_MUTED = "#ff453a"          # rojo estilo iOS
+    COLOR_METER_OFF = "#2a2a2a"      # segmento apagado (casi invisible)
     ICON_SIZE = 32
     PADDING = 4
-    METER_WIDTH = 6
+    METER_WIDTH = 7
     METER_GAP = 6
+    METER_SEGMENTS = 8
+    METER_SEG_HEIGHT = 3
+    METER_SEG_GAP = 1
+    # Sensibilidad del meter: multiplicador sobre el peak (voz normal RMS~0.1)
+    METER_SENSITIVITY = 5.0
 
     # Cadencia del tick: 40 ms visual, chequeo de mute cada 12 ticks (~500 ms)
     TICK_MS = 40
     MUTE_CHECK_EVERY = 12
+
+    # Gradiente de colores por segmento (abajo -> arriba): 3 verde, 3 amarillo, 2 rojo
+    METER_SEG_COLORS = [
+        "#30d158", "#30d158", "#30d158",
+        "#ffd60a", "#ffd60a", "#ffd60a",
+        "#ff9f0a", "#ff453a",
+    ]
 
     def __init__(self):
         self.volume = get_mic_volume()
@@ -136,60 +144,79 @@ class MicToggle:
         color = self.COLOR_MUTED if self.muted else self.COLOR_ACTIVE
         icon_w = self.ICON_SIZE + self.PADDING * 2
         h = int(self.root.geometry().split("x")[1].split("+")[0])
-        # Centrar el círculo verticalmente dentro del area del icono
         cx = icon_w // 2
         cy = h // 2
         r = self.ICON_SIZE // 2
-        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="")
-        # Micrófono
-        self.canvas.create_rectangle(cx - 4, cy - 10, cx + 4, cy - 1, fill="white", outline="")
-        self.canvas.create_arc(cx - 7, cy - 6, cx + 7, cy + 4, start=180, extent=180,
-                               outline="white", width=2, style="arc")
-        self.canvas.create_line(cx, cy + 4, cx, cy + 7, fill="white", width=2)
-        self.canvas.create_line(cx - 4, cy + 7, cx + 4, cy + 7, fill="white", width=2)
-        # Tachado si muteado
-        if self.muted:
-            self.canvas.create_line(cx - r + 4, cy - r + 4, cx + r - 4, cy + r - 4,
-                                    fill="#ffff64", width=2)
 
-        # VU meter vertical a la derecha del icono
+        # Halo sutil (circulo un poco mas grande con color desaturado) para dar profundidad
+        self.canvas.create_oval(cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1,
+                                fill=self._mix(color, self.TASKBAR_BG, 0.7), outline="")
+        # Circulo principal
+        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="")
+
+        # Icono microfono (proporciones mas finas)
+        # Cuerpo (capsula redondeada)
+        self.canvas.create_oval(cx - 4, cy - 11, cx + 4, cy - 3, fill="white", outline="")
+        self.canvas.create_rectangle(cx - 4, cy - 7, cx + 4, cy - 1, fill="white", outline="")
+        self.canvas.create_oval(cx - 4, cy - 3, cx + 4, cy + 1, fill="white", outline="")
+        # Soporte en U
+        self.canvas.create_arc(cx - 7, cy - 4, cx + 7, cy + 6, start=200, extent=140,
+                               outline="white", width=2, style="arc")
+        # Pie y base
+        self.canvas.create_line(cx, cy + 6, cx, cy + 9, fill="white", width=2)
+        self.canvas.create_line(cx - 4, cy + 9, cx + 4, cy + 9, fill="white", width=2)
+
+        # Tachado si muteado (diagonal fina, sutil)
+        if self.muted:
+            self.canvas.create_line(cx - r + 5, cy - r + 5, cx + r - 5, cy + r - 5,
+                                    fill="white", width=2)
+
+        # VU meter LED segmentado a la derecha del icono
         meter_x0 = icon_w + self.METER_GAP
         meter_x1 = meter_x0 + self.METER_WIDTH
-        meter_top = cy - r
-        meter_bot = cy + r
-        # Fondo fijo
-        self._meter_top = meter_top
-        self._meter_bot = meter_bot
-        self._meter_x0 = meter_x0
-        self._meter_x1 = meter_x1
-        self.canvas.create_rectangle(meter_x0, meter_top, meter_x1, meter_bot,
-                                     fill=self.COLOR_METER_BG, outline="")
-        # Fill (crece de abajo hacia arriba con el peak)
-        self._meter_fill = self.canvas.create_rectangle(
-            meter_x0, meter_bot, meter_x1, meter_bot,
-            fill=self.COLOR_METER_LOW, outline="",
-        )
+        total_h = self.METER_SEGMENTS * self.METER_SEG_HEIGHT + \
+                  (self.METER_SEGMENTS - 1) * self.METER_SEG_GAP
+        top_y = cy - total_h // 2
+
+        self._meter_segments = []
+        for i in range(self.METER_SEGMENTS):
+            # Segmentos se dibujan de arriba hacia abajo en el array,
+            # pero el indice 0 es el de ARRIBA (pico), el ultimo es el de ABAJO (base).
+            y0 = top_y + i * (self.METER_SEG_HEIGHT + self.METER_SEG_GAP)
+            y1 = y0 + self.METER_SEG_HEIGHT
+            seg_id = self.canvas.create_rectangle(
+                meter_x0, y0, meter_x1, y1,
+                fill=self.COLOR_METER_OFF, outline="",
+            )
+            self._meter_segments.append(seg_id)
+
+    def _mix(self, hex_a, hex_b, t):
+        """Interpola linealmente entre dos colores hex. t=0 -> a, t=1 -> b."""
+        def to_rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        a = to_rgb(hex_a)
+        b = to_rgb(hex_b)
+        mixed = tuple(int(a[i] * (1 - t) + b[i] * t) for i in range(3))
+        return "#{:02x}{:02x}{:02x}".format(*mixed)
 
     def _set_meter_level(self, level):
-        """level ∈ [0,1] -> actualiza la barra vertical."""
+        """level ∈ [0,1] -> enciende N segmentos de abajo hacia arriba."""
         level = max(0.0, min(1.0, level))
-        altura_total = self._meter_bot - self._meter_top
-        fill_top = self._meter_bot - int(altura_total * level)
+        n_total = self.METER_SEGMENTS
+        n_on = int(round(level * n_total))
 
-        if level < 0.05:
-            color = self.COLOR_METER_LOW
-        elif level < 0.40:
-            color = self.COLOR_METER_OK
-        elif level < 0.80:
-            color = self.COLOR_METER_HIGH
-        else:
-            color = self.COLOR_METER_PEAK
-
+        # _meter_segments[0] es el segmento de arriba (pico), [-1] es el de abajo (base).
+        # Si n_on = 3, se encienden los 3 de abajo: indices [n_total-1, n_total-2, n_total-3].
         try:
-            self.canvas.coords(self._meter_fill,
-                               self._meter_x0, fill_top,
-                               self._meter_x1, self._meter_bot)
-            self.canvas.itemconfig(self._meter_fill, fill=color)
+            for i, seg_id in enumerate(self._meter_segments):
+                # i=0 arriba. seg_pos = indice desde abajo (0..n_total-1).
+                seg_pos = n_total - 1 - i
+                if seg_pos < n_on:
+                    color = self.METER_SEG_COLORS[seg_pos]
+                else:
+                    color = self.COLOR_METER_OFF
+                self.canvas.itemconfig(seg_id, fill=color)
         except tk.TclError:
             pass
 
@@ -204,8 +231,10 @@ class MicToggle:
                 peak = float(self.meter.GetPeakValue())
             except Exception:
                 peak = 0.0
-        # Si esta muteado, forzamos barra en 0 (aunque peak podria venir != 0 en shared mode)
-        self._set_meter_level(0.0 if self.muted else peak)
+        # Si esta muteado, forzamos barra en 0 (aunque peak podria venir != 0 en shared mode).
+        # Aplicamos multiplicador de sensibilidad: voz normal ~0.1 raw -> 0.5 en meter.
+        display = 0.0 if self.muted else min(peak * self.METER_SENSITIVITY, 1.0)
+        self._set_meter_level(display)
 
         # Cada N ticks, sincronizar estado de mute con el real del mic
         self._tick_count += 1
