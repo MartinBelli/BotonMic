@@ -90,15 +90,22 @@ def get_mic_volume():
 
 
 class DictadoOverlay:
-    """Ventana pequena flotante con indicador de estado del dictado."""
+    """Ventana pequena flotante con indicador de estado y VU meter."""
 
     BG = "#1f1f1f"
     COLOR_IDLE = "#3a3a3a"
     COLOR_REC = "#dc3232"
     COLOR_TRANS = "#f0a020"
     COLOR_LOAD = "#4080e0"
-    WIDTH = 180
+    METER_BG = "#2a2a2a"
+    WIDTH = 260
     HEIGHT = 36
+
+    # Layout del meter
+    METER_X0 = 150
+    METER_X1 = 250
+    METER_Y0 = 13
+    METER_Y1 = 23
 
     def __init__(self):
         self.root = tk.Tk()
@@ -127,7 +134,26 @@ class DictadoOverlay:
             text="Listo", fill="white", font=("Segoe UI", 10, "bold"),
         )
 
+        # VU meter: fondo + barra de fill que crece con el nivel
+        self._meter_bg = self.canvas.create_rectangle(
+            self.METER_X0, self.METER_Y0, self.METER_X1, self.METER_Y1,
+            fill=self.METER_BG, outline="",
+        )
+        self._meter_fill = self.canvas.create_rectangle(
+            self.METER_X0, self.METER_Y0, self.METER_X0, self.METER_Y1,
+            fill=self.COLOR_IDLE, outline="",
+        )
+
+        # Estado interno del meter
+        self._level_source = None  # callable que devuelve float [0,1]
+        self._meter_running = False
+        self._estado = "idle"
+
         self.set_state("idle")
+
+    def bind_level_source(self, getter):
+        """Registrar una funcion callable que devuelve el nivel actual [0,1]."""
+        self._level_source = getter
 
     def set_state(self, estado):
         """Estados: idle, cargando, grabando, transcribiendo."""
@@ -140,14 +166,56 @@ class DictadoOverlay:
         color, texto = mapping.get(estado, (self.COLOR_IDLE, "Listo"))
         self.canvas.itemconfig(self._dot, fill=color)
         self.canvas.itemconfig(self._label, text=texto)
+        self._estado = estado
 
         # En idle ocultamos la ventana para no distraer
         if estado == "idle":
+            self.set_level(0.0)
+            self._meter_running = False
             self.root.withdraw()
         else:
             self.root.deiconify()
             self.root.lift()
             self.root.attributes("-topmost", True)
+
+        # Solo mostramos el meter activo durante grabacion
+        if estado == "grabando":
+            if not self._meter_running:
+                self._meter_running = True
+                self._refresh_level_loop()
+        else:
+            self._meter_running = False
+            if estado != "idle":
+                self.set_level(0.0)
+
+    def set_level(self, level):
+        """level ∈ [0,1] -> redimensiona el fill y le asigna color segun el rango."""
+        level = max(0.0, min(1.0, level))
+        x0 = self.METER_X0
+        x1 = x0 + int((self.METER_X1 - self.METER_X0) * level)
+        self.canvas.coords(
+            self._meter_fill, x0, self.METER_Y0, x1, self.METER_Y1,
+        )
+
+        if level < 0.05:
+            color = "#3a3a3a"   # gris: casi silencio
+        elif level < 0.40:
+            color = "#28be5c"   # verde: OK
+        elif level < 0.80:
+            color = "#f0c020"   # amarillo: alto
+        else:
+            color = "#dc3232"   # rojo: clipping
+        self.canvas.itemconfig(self._meter_fill, fill=color)
+
+    def _refresh_level_loop(self):
+        """Corre cada 40ms mientras estado == grabando, leyendo _level_source."""
+        if not self._meter_running or self._level_source is None:
+            return
+        try:
+            self.set_level(self._level_source())
+        except Exception:
+            pass
+        self.root.after(40, self._refresh_level_loop)
 
 
 class MicDictado:
@@ -161,6 +229,10 @@ class MicDictado:
         self._audio_buffer = []
         self._buffer_lock = threading.Lock()
         self._stream = None
+
+        # Nivel actual del audio para el VU meter (asignacion atomica, sin lock)
+        self._current_level = 0.0
+        self.overlay.bind_level_source(lambda: self._current_level)
 
         # Hotkey en hilo daemon (mismo patron que mic_tray.py:103-109)
         self._hotkey_thread = threading.Thread(target=self._listen_hotkey, daemon=True)
@@ -193,11 +265,18 @@ class MicDictado:
             self._start_recording()
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """Callback de sounddevice: appendea chunk int16 al buffer."""
+        """Callback de sounddevice: appendea chunk int16 al buffer y actualiza VU meter."""
         if status:
             print(f"[audio] status: {status}")
         with self._buffer_lock:
             self._audio_buffer.append(indata.copy())
+
+        # Calcular RMS del chunk (normalizado int16 -> float [0,1]) para el VU meter.
+        # Multiplicamos x4 porque voz normal suele dar RMS ~0.05-0.15; asi la barra
+        # tiene rango util sin que haya que gritar para llegar a amarillo.
+        chunk_f = indata.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(chunk_f ** 2)))
+        self._current_level = min(rms * 4.0, 1.0)
 
     def _start_recording(self):
         try:
