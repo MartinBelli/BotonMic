@@ -9,8 +9,10 @@ el estado previo al terminar.
 Requiere: pip install -r requirements.txt
 """
 
+import atexit
 import ctypes
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,13 +37,47 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
 
-# ── Mutex: impedir multiples instancias ──────────────────────────
-_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "Global\\MicDictadoMutex")
-if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-    ctypes.windll.user32.MessageBoxW(
-        0, "MicDictado ya esta corriendo.", "MicDictado", 0x40
-    )
-    sys.exit(0)
+# ── Single-instance: kill + replace via lockfile con PID ────────
+# Si ya hay una instancia corriendo, la matamos y nos quedamos con la nueva.
+# Util en desarrollo (no hay que ir al Task Manager) y tambien si quedo zombie.
+_LOCK_DIR = os.path.join(tempfile.gettempdir(), "MicDictado")
+_LOCKFILE = os.path.join(_LOCK_DIR, "mic_dictado.pid")
+
+
+def _enforce_single_instance():
+    os.makedirs(_LOCK_DIR, exist_ok=True)
+    if os.path.exists(_LOCKFILE):
+        try:
+            with open(_LOCKFILE, "r", encoding="utf-8") as f:
+                old_pid = int(f.read().strip())
+            if old_pid and old_pid != os.getpid():
+                # taskkill silencioso (si el PID no existe, simplemente devuelve error y sigue)
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(old_pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                )
+                time.sleep(0.3)  # darle tiempo a liberar recursos (mic COM, audio device)
+        except (ValueError, OSError):
+            pass
+    with open(_LOCKFILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    atexit.register(_cleanup_lockfile)
+
+
+def _cleanup_lockfile():
+    try:
+        if os.path.exists(_LOCKFILE):
+            with open(_LOCKFILE, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            # Solo borrar si es nuestro (no borrar el de otra instancia que nos reemplazo)
+            if pid == os.getpid():
+                os.remove(_LOCKFILE)
+    except Exception:
+        pass
+
+
+_enforce_single_instance()
 
 
 def get_mic_volume():
