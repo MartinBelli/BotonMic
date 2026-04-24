@@ -21,6 +21,7 @@ import tkinter as tk
 from ctypes import wintypes
 
 import numpy as np
+import pyperclip
 import sounddevice as sd
 from comtypes import CLSCTX_ALL
 from faster_whisper import WhisperModel
@@ -95,6 +96,50 @@ def get_mic_volume():
         raise RuntimeError("No se encontro microfono por defecto")
     interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
     return interface.QueryInterface(IAudioEndpointVolume)
+
+
+# ── Pegado de texto: clipboard + Ctrl+V via keybd_event ──────────
+# keybd_event es legacy pero confiable en Win10/11. Usamos Ctrl+V en lugar de
+# tipear con pyautogui porque es mucho mas rapido y funciona con acentos/ñ en
+# todas las apps (Chrome, VSCode, terminales, Notion, etc).
+_VK_CONTROL = 0x11
+_VK_V = 0x56
+_KEYEVENTF_KEYUP = 0x0002
+
+
+def paste_text(texto):
+    """Copia texto al clipboard, simula Ctrl+V, y restaura el clipboard previo."""
+    if not texto:
+        return
+    try:
+        clipboard_prev = pyperclip.paste()
+    except Exception:
+        clipboard_prev = None
+
+    try:
+        pyperclip.copy(texto)
+    except Exception as e:
+        print(f"[MicDictado] error copiando al clipboard: {e}")
+        return
+
+    # Pequeño delay para que el clipboard se estabilice antes de Ctrl+V
+    time.sleep(0.05)
+
+    user32 = ctypes.windll.user32
+    user32.keybd_event(_VK_CONTROL, 0, 0, 0)                # Ctrl down
+    user32.keybd_event(_VK_V, 0, 0, 0)                      # V down
+    user32.keybd_event(_VK_V, 0, _KEYEVENTF_KEYUP, 0)       # V up
+    user32.keybd_event(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0) # Ctrl up
+
+    # Restaurar clipboard previo con delay: algunas apps leen el clipboard
+    # de forma asincrona en el WM_PASTE (ej. VSCode), por eso esperamos.
+    if clipboard_prev is not None:
+        def _restore():
+            try:
+                pyperclip.copy(clipboard_prev)
+            except Exception:
+                pass
+        threading.Timer(0.3, _restore).start()
 
 
 class DictadoOverlay:
@@ -387,6 +432,10 @@ class MicDictado:
             texto = " ".join(seg.text.strip() for seg in segments).strip()
             elapsed = time.time() - t0
             print(f"[MicDictado] transcripcion ({elapsed:.1f}s): {texto!r}")
+
+            # Pegar donde esta el cursor (preservando clipboard previo)
+            if texto:
+                paste_text(texto)
         except Exception as e:
             print(f"[MicDictado] error procesando audio: {e}")
             import traceback
