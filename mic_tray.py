@@ -1,9 +1,13 @@
 """
 mic_tray.py — Toggle de micrófono en la barra de tareas de Windows.
 
-Widget con disco gris, icono de microfono neutro y halo glow en arco
-superior (9 a 3) que se ilumina verde (activo) o rojo (muteado). Cuando
-hablas, el halo verde crece en grosor y satura con el nivel de voz.
+Widget "circular" (transparentcolor) con disco gris, micrófono gris claro
+en el centro, y un arco de halo de las 7 a las 5 (pasando por arriba).
+Cuando el mic está activo el arco se pinta de verde claro; al hablar se
+sobrepinta con verde saturado creciendo de izquierda (7) a derecha (5),
+funcionando como VU meter angular. Muteado: arco en rojo tenue.
+
+Render con Pillow + supersampling 2x para antialiasing.
 
 Requiere: pip install -r requirements.txt
 """
@@ -21,6 +25,7 @@ from ctypes import wintypes
 
 import numpy as np
 import sounddevice as sd
+from PIL import Image, ImageDraw, ImageTk
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
@@ -95,16 +100,9 @@ def get_taskbar_rect():
 
 
 class _AudioMonitor:
-    """Stream permanente de sounddevice que publica el nivel RMS actual del mic.
+    """Stream permanente que publica el nivel RMS actual del mic default."""
 
-    Necesario porque IAudioMeterInformation no reporta peak en el Focusrite y
-    otros drivers USB si no hay un cliente activo grabando. Con un InputStream
-    propio siempre abierto, tenemos RMS confiable en todo momento.
-
-    level: float [0,1], atomico. Leelo desde el hilo de Tk sin lock.
-    """
-
-    SENSITIVITY = 4.0  # multiplicador sobre RMS raw (voz normal ~0.05-0.15)
+    SENSITIVITY = 4.0
     WATCHDOG_INTERVAL_S = 2.0
     BACKOFF_MAX_S = 10.0
 
@@ -121,7 +119,6 @@ class _AudioMonitor:
         atexit.register(self.close)
 
     def _callback(self, indata, frames, time_info, status):
-        # RMS del chunk normalizado [0,1], multiplicado por sensibilidad.
         try:
             rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
             self.level = min(rms * self.SENSITIVITY, 1.0)
@@ -129,15 +126,13 @@ class _AudioMonitor:
             self.level = 0.0
 
     def _open(self):
-        """Abre el InputStream del device default. Si falla deja _stream=None."""
         try:
             device = sd.default.device[0]
             if device is None or device < 0:
-                # sd.default puede ser (-1,-1) si no hay default. Usar hostapi.
                 device = sd.query_hostapis()[sd.default.hostapi]["default_input_device"]
             stream = sd.InputStream(
                 device=device,
-                samplerate=None,   # nativo del device, evita "Invalid sample rate"
+                samplerate=None,
                 channels=1,
                 dtype="float32",
                 blocksize=0,
@@ -161,7 +156,6 @@ class _AudioMonitor:
             self._stream = None
 
     def _watchdog_loop(self):
-        """Detecta stream muerto (sleep, desconexion) o cambio de default device."""
         while not self._shutdown:
             time.sleep(self.WATCHDOG_INTERVAL_S)
             if self._shutdown:
@@ -176,7 +170,6 @@ class _AudioMonitor:
                             needs_reopen = True
                     except Exception:
                         needs_reopen = True
-                    # Comparamos default actual vs el que abrimos
                     try:
                         new_default = sd.default.device[0]
                         if new_default is not None and new_default != self._current_device:
@@ -191,7 +184,6 @@ class _AudioMonitor:
                     if self._stream is not None:
                         self._backoff = 1.0
                     else:
-                        # Backoff progresivo si sigue fallando (mic fisicamente desconectado)
                         time.sleep(self._backoff)
                         self._backoff = min(self._backoff * 2.0, self.BACKOFF_MAX_S)
             except Exception as e:
@@ -202,27 +194,35 @@ class _AudioMonitor:
         self._close_stream()
 
 
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
 class MicToggle:
-    TASKBAR_BG = "#1f1f1f"
-    # Disco e icono
-    DISC_COLOR = "#2a2a2a"
-    MIC_COLOR = "#9a9a9a"
-    # Halo colors
-    HALO_GREEN_LOW = "#3fa861"    # verde claro en reposo
-    HALO_GREEN_HIGH = "#0a6f2a"   # verde oscuro saturado hablando
-    HALO_RED = "#c84545"          # rojo mute constante
+    # Color magico: se vuelve transparente por -transparentcolor.
+    # Uso un negro casi puro que no aparece en ningun dibujo.
+    TRANSPARENT_BG = "#010101"
 
-    ICON_SIZE = 32
-    HALO_MARGIN = 10  # margen alrededor del disco para los arcos del halo
+    # Paleta
+    DISC_COLOR = "#2a2a2a"        # gris oscuro del disco
+    MIC_COLOR = "#b5b5b5"         # gris claro del icono mic
+    HALO_BASE_GREEN = "#9fd9b1"   # verde pastel claro (reposo)
+    HALO_FILL_GREEN = "#3fa861"   # verde saturado (hablando)
+    HALO_BASE_RED = "#d86666"     # rojo tenue (muteado)
 
-    # Cadencia del tick: 40 ms visual, chequeo de mute cada 12 ticks (~500 ms)
+    # Proporciones del render (en unidades del supersample). Se calculan
+    # relativas al alto del widget (que coincide con el taskbar) al inicializar.
+    SUPERSAMPLE = 2
+
+    # Cadencia del tick
     TICK_MS = 40
-    MUTE_CHECK_EVERY = 12
+    MUTE_CHECK_EVERY = 12  # 12 * 40ms = 480ms
 
-    # Radios adicionales para los 4 arcos del halo (sobre r del disco)
-    HALO_OFFSETS = (2, 4, 6, 8)
-    # Fade base de los 3 exteriores (0 = no fade, 1 = puro BG). Interior tiene fade 0.
-    HALO_OUTER_FADE = (0.3, 0.55, 0.8)
+    # Arco del halo: convención PIL (0° = 3 en reloj, CW+).
+    # 7 en reloj = 120° PIL, 5 = 60° PIL. De 7 a 5 pasando por arriba = 300°.
+    HALO_START = 120
+    HALO_EXTENT = 300
 
     def __init__(self):
         self.volume = get_mic_volume()
@@ -234,43 +234,49 @@ class MicToggle:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-toolwindow", True)
-        self.root.configure(bg=self.TASKBAR_BG)
+        self.root.configure(bg=self.TRANSPARENT_BG)
+        # Hace que el TRANSPARENT_BG se vea transparente (efecto de "widget circular")
+        self.root.wm_attributes("-transparentcolor", self.TRANSPARENT_BG)
 
-        # Widget cuadrado: icono + margen para el halo de ambos lados
-        w = self.ICON_SIZE + self.HALO_MARGIN * 2
+        # Widget cuadrado del alto del taskbar
         taskbar = get_taskbar_rect()
         taskbar_h = taskbar.bottom - taskbar.top
-
-        x = taskbar.right - w - 200  # a la izquierda del systray
+        w = h = taskbar_h
+        x = taskbar.right - w - 200
         y = taskbar.top
-        h = taskbar_h
 
-        # Guardamos dimensiones como atributos: no leer self.root.geometry() en _draw
-        # porque Tk puede no haber aplicado la geometry aun al primer dibujo,
-        # devolviendo "1x1+0+0" y rompiendo el layout hasta el primer redraw.
-        self._widget_w = w
-        self._widget_h = h
-
+        self._widget_size = w  # ancho == alto
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Proporciones relativas al alto del widget
+        self._disc_radius = int(w * 0.26)          # ~12 px si w=48
+        self._halo_inner_r = self._disc_radius + max(2, int(w * 0.06))
+        self._halo_width = max(4, int(w * 0.11))   # grosor del arco
+        self._halo_outer_r = self._halo_inner_r + self._halo_width
+        self._mic_scale = w / 48.0                  # para escalar el mic
 
         self.canvas = tk.Canvas(
             self.root, width=w, height=h,
-            highlightthickness=0, cursor="hand2", bg=self.TASKBAR_BG,
+            highlightthickness=0, cursor="hand2", bg=self.TRANSPARENT_BG,
+            borderwidth=0,
         )
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self._on_click)
 
-        # Drag para reposicionar en la barra
+        # Drag para reposicionar
         self._drag_data = {}
         self.canvas.bind("<Button-3>", self._start_drag)
         self.canvas.bind("<B3-Motion>", self._do_drag)
 
-        self._halo_arcs = []  # 4 arc items, orden: interior -> exterior
+        self._photo = None
+        self._canvas_image = self.canvas.create_image(0, 0, anchor="nw", image=None)
+
         self._tick_count = 0
-        self._draw()
+        self._last_rendered_key = None  # cache para evitar re-render inutil
+        self._render(self._current_display_level())
         self._tick()
 
-        # Hotkey global Ctrl+Shift+F12
+        # Hotkey global
         self._hotkey_thread = threading.Thread(target=self._listen_hotkey, daemon=True)
         self._hotkey_thread.start()
 
@@ -281,93 +287,137 @@ class MicToggle:
             if msg.message == 0x0312:  # WM_HOTKEY
                 self.root.after(0, self._on_click, None)
 
-    @staticmethod
-    def _mix(hex_a, hex_b, t):
-        """Lerp entre dos colores hex en espacio RGB. t=0 -> a, t=1 -> b."""
-        def to_rgb(h):
-            h = h.lstrip("#")
-            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
-        a = to_rgb(hex_a)
-        b = to_rgb(hex_b)
-        t = max(0.0, min(1.0, t))
-        r = int(a[0] * (1 - t) + b[0] * t)
-        g = int(a[1] * (1 - t) + b[1] * t)
-        bl = int(a[2] * (1 - t) + b[2] * t)
-        return f"#{r:02x}{g:02x}{bl:02x}"
+    def _current_display_level(self):
+        """Nivel a mostrar: 0 si muted, sino level comprimido con sqrt."""
+        if self.muted:
+            return 0.0
+        raw = self.monitor.level
+        return min(1.0, raw) ** 0.5
 
-    def _draw(self):
-        self.canvas.delete("all")
-        w = self._widget_w
-        h = self._widget_h
-        cx = w // 2
-        cy = h // 2
-        r = self.ICON_SIZE // 2
-
-        # Halo: 4 arcos concentricos en la mitad superior (9 a 3 en reloj).
-        # Tk create_arc con start=0, extent=180 traza de angulo 0° (3 en reloj)
-        # hacia 180° (9 en reloj) pasando por arriba.
-        self._halo_arcs = []
-        for extra in self.HALO_OFFSETS:
-            arc_id = self.canvas.create_arc(
-                cx - (r + extra), cy - (r + extra),
-                cx + (r + extra), cy + (r + extra),
-                start=0, extent=180, style="arc",
-                outline=self.TASKBAR_BG, width=2,
-            )
-            self._halo_arcs.append(arc_id)
-
-        # Disco base gris
-        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                fill=self.DISC_COLOR, outline="")
-        # Microfono en gris claro
-        mc = self.MIC_COLOR
-        self.canvas.create_rectangle(cx - 4, cy - 10, cx + 4, cy - 1, fill=mc, outline="")
-        self.canvas.create_arc(cx - 7, cy - 6, cx + 7, cy + 4, start=180, extent=180,
-                               outline=mc, width=2, style="arc")
-        self.canvas.create_line(cx, cy + 4, cx, cy + 7, fill=mc, width=2)
-        self.canvas.create_line(cx - 4, cy + 7, cx + 4, cy + 7, fill=mc, width=2)
-
-        # Pintar el halo inicial
-        self._set_halo(0.0)
-
-    def _set_halo(self, level):
-        """level ∈ [0,1] -> actualiza color y grosor del halo segun estado+nivel."""
-        if not self._halo_arcs:
+    def _render(self, level):
+        """Renderiza el halo+disco+mic a imagen con Pillow y la muestra."""
+        # Cache: solo re-renderizar si algo cambió significativamente
+        # (level redondeado a 0.02 + estado muted). Evita ~30 renders/seg inutiles.
+        key = (self.muted, round(level, 2))
+        if key == self._last_rendered_key:
             return
-        level = max(0.0, min(1.0, level))
+        self._last_rendered_key = key
+
+        SS = self.SUPERSAMPLE
+        W = self._widget_size * SS
+        H = self._widget_size * SS
+
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # transparente
+        draw = ImageDraw.Draw(img)
+
+        cx = W // 2
+        cy = H // 2
+
+        # ── Halo ──────────────────────────────────────────────
+        halo_outer_ss = self._halo_outer_r * SS
+        halo_inner_ss = self._halo_inner_r * SS
+        halo_center_r = (halo_outer_ss + halo_inner_ss) // 2
+        halo_w_ss = halo_outer_ss - halo_inner_ss
+
+        halo_bbox = (cx - halo_center_r, cy - halo_center_r,
+                     cx + halo_center_r, cy + halo_center_r)
 
         if self.muted:
-            core_color = self.HALO_RED
-            effective_level = 0.0  # rojo constante, no responde al nivel
+            base_color = _hex_to_rgb(self.HALO_BASE_RED)
+            # En muted, el halo es tenue constante (sin fill).
+            draw.arc(
+                halo_bbox,
+                start=self.HALO_START,
+                end=self.HALO_START + self.HALO_EXTENT,
+                fill=base_color,
+                width=halo_w_ss,
+            )
         else:
-            # Verde claro (silencio) -> verde oscuro saturado (hablando)
-            core_color = self._mix(self.HALO_GREEN_LOW, self.HALO_GREEN_HIGH, level)
-            effective_level = level
+            base_color = _hex_to_rgb(self.HALO_BASE_GREEN)
+            fill_color = _hex_to_rgb(self.HALO_FILL_GREEN)
 
-        # Arco interior: width variable con el nivel (2 -> 6)
+            # Capa base: arco completo verde claro
+            draw.arc(
+                halo_bbox,
+                start=self.HALO_START,
+                end=self.HALO_START + self.HALO_EXTENT,
+                fill=base_color,
+                width=halo_w_ss,
+            )
+
+            # Capa fill: arco verde saturado que crece de 7 a 5 con el nivel
+            if level > 0.01:
+                fill_end = self.HALO_START + self.HALO_EXTENT * min(1.0, level)
+                draw.arc(
+                    halo_bbox,
+                    start=self.HALO_START,
+                    end=fill_end,
+                    fill=fill_color,
+                    width=halo_w_ss,
+                )
+
+        # ── Disco ──────────────────────────────────────────────
+        r_disc = self._disc_radius * SS
+        draw.ellipse(
+            (cx - r_disc, cy - r_disc, cx + r_disc, cy + r_disc),
+            fill=_hex_to_rgb(self.DISC_COLOR),
+        )
+
+        # ── Icono del mic (mas chico, centrado en el disco) ────
+        mc = _hex_to_rgb(self.MIC_COLOR)
+        s = self._mic_scale * SS  # factor escala
+
+        cap_w = int(6 * s)
+        cap_h = int(11 * s)
+        cap_top = cy - int(7 * s)
+        cap_bot = cap_top + cap_h
+        cap_left = cx - cap_w // 2
+        cap_right = cx + cap_w // 2
+
+        # Cápsula redondeada (cuerpo del mic)
         try:
-            interior_width = 2 + int(effective_level * 4)
-            self.canvas.itemconfig(self._halo_arcs[0],
-                                   outline=core_color, width=interior_width)
-            # Exteriores: fade progresivo hacia el BG. A mayor level, menos fade
-            # -> halo parece "crecer" visualmente aunque los radios sean fijos.
-            for i, fade_base in enumerate(self.HALO_OUTER_FADE):
-                # fade: en level=1 usa fade_base; en level=0 fade = fade_base + 0.2 (mas BG)
-                fade = min(1.0, fade_base + (1.0 - effective_level) * 0.2)
-                color = self._mix(core_color, self.TASKBAR_BG, fade)
-                self.canvas.itemconfig(self._halo_arcs[i + 1],
-                                       outline=color, width=2)
-        except tk.TclError:
-            pass
+            draw.rounded_rectangle(
+                (cap_left, cap_top, cap_right, cap_bot),
+                radius=cap_w // 2,
+                fill=mc,
+            )
+        except AttributeError:
+            # Fallback a rectangle si Pillow viejo
+            draw.rectangle((cap_left, cap_top, cap_right, cap_bot), fill=mc)
+
+        # Soporte en U debajo del cuerpo
+        u_w = int(12 * s)
+        u_h = int(8 * s)
+        u_top = cap_bot - int(2 * s)
+        u_bbox = (cx - u_w // 2, u_top, cx + u_w // 2, u_top + u_h)
+        u_line = max(1, int(1.8 * s))
+        # En PIL: start=0, end=180 traza desde 3 CW hasta 9 pasando por 6 (abajo) = U abierta hacia arriba
+        draw.arc(u_bbox, start=0, end=180, fill=mc, width=u_line)
+
+        # Pie del mic
+        stand_top = u_top + u_h // 2 + int(1 * s)
+        stand_bot = stand_top + int(3 * s)
+        stand_line = max(1, int(1.8 * s))
+        draw.line([(cx, stand_top), (cx, stand_bot)], fill=mc, width=stand_line)
+
+        # Base del pie
+        base_half = int(4 * s)
+        draw.line(
+            [(cx - base_half, stand_bot), (cx + base_half, stand_bot)],
+            fill=mc, width=stand_line,
+        )
+
+        # ── Downscale con antialiasing ──────────────────────────
+        img = img.resize((self._widget_size, self._widget_size), Image.LANCZOS)
+
+        # Actualizar imagen en canvas
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.itemconfig(self._canvas_image, image=self._photo)
 
     def _tick(self):
-        # Nivel actual desde el monitor de audio permanente.
-        # Aplicamos compresor suave (sqrt) para expandir rango bajo y comprimir saturacion.
-        raw = self.monitor.level
-        display = 0.0 if self.muted else min(1.0, raw) ** 0.5
-        self._set_halo(display)
+        display = self._current_display_level()
+        self._render(display)
 
-        # Cada N ticks, sincronizar estado de mute con el real del mic.
         self._tick_count += 1
         if self._tick_count >= self.MUTE_CHECK_EVERY:
             self._tick_count = 0
@@ -381,9 +431,8 @@ class MicToggle:
                     real_muted = self.muted
             if real_muted != self.muted:
                 self.muted = real_muted
-                # Si cambio el estado, forzamos redraw para que el proximo _set_halo
-                # use el color correcto. Los arcos ya existen, solo el color cambia.
-                self._set_halo(display)
+                self._last_rendered_key = None  # forzar re-render
+                self._render(self._current_display_level())
 
         try:
             self.root.after(self.TICK_MS, self._tick)
@@ -400,8 +449,8 @@ class MicToggle:
             current = self.volume.GetMute()
             self.volume.SetMute(not current, None)
             self.muted = not current
-        # Forzar refresh inmediato del halo
-        self._set_halo(0.0 if self.muted else min(1.0, self.monitor.level) ** 0.5)
+        self._last_rendered_key = None
+        self._render(self._current_display_level())
 
     def _start_drag(self, event):
         self._drag_data = {"x": event.x}
