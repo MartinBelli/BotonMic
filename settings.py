@@ -1,0 +1,93 @@
+"""
+settings.py — Configuracion persistente de MicDictado.
+
+JSON en %APPDATA%\\MicDictado\\settings.json. Singleton 'settings' cargado al
+importar el modulo. Tolera archivos viejos / claves nuevas via merge sobre
+DEFAULTS.
+"""
+
+import json
+import os
+import tempfile
+import threading
+
+
+DEFAULTS = {
+    # VU meter
+    "vu_gain": 7.0,                  # 1.0 - 15.0 (mas alto = mas sensible)
+
+    # Ducking de musica
+    "ducking_enabled": True,
+    "ducking_volume_pct": 25,        # 0 - 100, % del volumen original
+    "ducking_exclude": [
+        "Discord.exe",
+        "Teams.exe",
+        "ms-teams.exe",
+        "Zoom.exe",
+        "slack.exe",
+    ],
+
+    # Transcripcion
+    "model_name": "small",           # tiny | base | small | medium
+    "beam_size": 1,                  # 1 = greedy, mas alto = mas preciso/lento
+    "vad_filter": True,
+}
+
+
+_SETTINGS_DIR = os.path.join(
+    os.environ.get("APPDATA", tempfile.gettempdir()),
+    "MicDictado",
+)
+_SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "settings.json")
+
+
+class _Settings:
+    """Singleton de configuracion. Acceso a claves via atributos: settings.vu_gain."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = dict(DEFAULTS)
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(_SETTINGS_FILE):
+            return
+        try:
+            with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            if isinstance(disk, dict):
+                merged = dict(DEFAULTS)
+                for k, v in disk.items():
+                    if k in DEFAULTS:
+                        merged[k] = v
+                self._data = merged
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[settings] error leyendo {_SETTINGS_FILE}: {e}; uso defaults")
+
+    def save(self):
+        try:
+            os.makedirs(_SETTINGS_DIR, exist_ok=True)
+            tmp = _SETTINGS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, _SETTINGS_FILE)
+        except OSError as e:
+            print(f"[settings] error guardando {_SETTINGS_FILE}: {e}")
+
+    def update(self, **kwargs):
+        """Actualiza claves validas y persiste a disco."""
+        with self._lock:
+            for k, v in kwargs.items():
+                if k in DEFAULTS:
+                    self._data[k] = v
+            self.save()
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name in DEFAULTS:
+            return self._data.get(name, DEFAULTS[name])
+        raise AttributeError(name)
+
+
+settings = _Settings()

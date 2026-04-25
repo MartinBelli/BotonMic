@@ -11,6 +11,7 @@ Requiere: pip install -r requirements.txt
 
 import atexit
 import ctypes
+import math
 import os
 import subprocess
 import sys
@@ -22,15 +23,28 @@ from ctypes import wintypes
 
 import numpy as np
 import sounddevice as sd
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 from comtypes import CLSCTX_ALL
 from faster_whisper import WhisperModel
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-# ── Hotkey global: Ctrl+Shift+F11 ──────────────────────────────
+from audio_ducker import AudioDucker
+from settings import settings
+
+# ── Hotkeys globales ──────────────────────────────────────────
+# F11:           toggle grabacion. Auto-pega cuando termina la transcripcion.
+# Shift+Space:   re-pega el ULTIMO texto transcripto donde este el cursor (util si el
+#                auto-pegado fue al lugar equivocado por cambio de foco).
+# F9:            abre la ventana de Configuracion.
+# (No usamos F12 porque ya lo usa mic_tray.py para mute/unmute)
 MOD_CTRL = 0x0002
 MOD_SHIFT = 0x0004
+VK_SPACE = 0x20
+VK_F9 = 0x78
 VK_F11 = 0x7A
-HOTKEY_ID = 2  # distinto al de MicToggle (que usa 1)
+HOTKEY_ID_TOGGLE = 2     # Ctrl+Shift+F11 (distinto al de MicToggle que usa 1)
+HOTKEY_ID_REPASTE = 3    # Ctrl+Shift+Space
+HOTKEY_ID_SETTINGS = 4   # Ctrl+Shift+F9
 
 # ── Captura de audio ─────────────────────────────────────────────
 SAMPLE_RATE = 16000
@@ -38,7 +52,8 @@ CHANNELS = 1
 DTYPE = "int16"
 
 # ── Modelo de transcripcion ──────────────────────────────────────
-MODEL_NAME = "small"  # ~470 MB descargado, decente en español
+# El modelo concreto sale de settings.model_name (tiny/base/small/medium).
+# El default en settings.DEFAULTS es "small" (~470 MB, balance precision/velocidad en es).
 MODEL_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
     "MicDictado", "models",
@@ -157,6 +172,39 @@ class _INPUT(ctypes.Structure):
     ]
 
 
+# Virtual-keys de los modificadores que pueden quedar "presionados" cuando
+# el tipeo se dispara desde un hotkey (WM_HOTKEY llega con Ctrl/Shift down).
+_VK_MODIFIERS = (
+    0xA2,  # VK_LCONTROL
+    0xA3,  # VK_RCONTROL
+    0xA0,  # VK_LSHIFT
+    0xA1,  # VK_RSHIFT
+    0xA4,  # VK_LMENU (Alt izq)
+    0xA5,  # VK_RMENU (Alt der)
+    0x5B,  # VK_LWIN
+    0x5C,  # VK_RWIN
+)
+
+
+def _release_modifiers():
+    """Sintetiza key-up de Ctrl/Shift/Alt/Win.
+
+    Necesario antes de hacer type_text_unicode disparado desde un hotkey: el
+    usuario aun tiene Ctrl+Shift fisicamente pulsados, y sin esto las primeras
+    letras Unicode se interpretan como atajos (Ctrl+B, Ctrl+S...) en la app
+    destino y "se comen" parte del texto. SendInput de KEYUP solo afecta el
+    estado logico que ve la app destino; las teclas fisicas siguen pulsadas
+    hasta que el usuario las suelte de verdad."""
+    inputs = []
+    for vk in _VK_MODIFIERS:
+        inp = _INPUT()
+        inp.type = _INPUT_KEYBOARD
+        inp.union.ki = _KEYBDINPUT(vk, 0, _KEYEVENTF_KEYUP, 0, None)
+        inputs.append(inp)
+    arr = (_INPUT * len(inputs))(*inputs)
+    ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT))
+
+
 def type_text_unicode(texto, batch_size=20, batch_delay=0.005):
     """Tipea texto caracter por caracter con SendInput KEYEVENTF_UNICODE.
 
@@ -200,23 +248,74 @@ def type_text_unicode(texto, batch_size=20, batch_delay=0.005):
             time.sleep(batch_delay)
 
 
-class DictadoOverlay:
-    """Ventana pequena flotante con indicador de estado y VU meter."""
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
-    BG = "#1f1f1f"
+
+def _lerp_rgb(c1, c2, t):
+    """Interpola entre dos colores RGB. t=0 -> c1, t=1 -> c2."""
+    t = max(0.0, min(1.0, t))
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
+
+
+class DictadoOverlay:
+    """Overlay flotante con forma de pildora redondeada renderizada con Pillow.
+
+    Layout horizontal: dot de estado a la izq + etiqueta + 10 LEDs como VU meter
+    a la derecha. La pildora se logra con transparentcolor (los pixeles fuera del
+    rectangulo redondeado son del color magico que Tk vuelve transparente).
+    """
+
+    # ── Geometria ────────────────────────────────────────────────
+    WIDTH = 260
+    HEIGHT = 32
+    SUPERSAMPLE = 2
+    PILL_RADIUS = 14
+
+    # Layout interno (en px regulares, sin SS)
+    DOT_CX = 18
+    DOT_CY = 16
+    DOT_R = 5
+    HALO_R = 9    # radio externo del halo
+
+    LABEL_X = 32
+    LABEL_FONT_SIZE = 11
+
+    LED_COUNT = 10
+    LED_X0 = 145          # primer LED empieza aqui
+    LED_W = 8
+    LED_GAP = 2
+    LED_Y0 = 11
+    LED_Y1 = 21
+    LED_RADIUS = 2        # esquinas redondeadas de cada segmento
+
+    # ── Colores ──────────────────────────────────────────────────
+    BG_PILL = "#1f1f1f"
+    # Magenta puro: muy improbable que aparezca en el render real, sirve como
+    # color clave de transparencia para -transparentcolor.
+    TRANSPARENT_KEY = "#ff00ff"
+
     COLOR_IDLE = "#3a3a3a"
     COLOR_REC = "#dc3232"
     COLOR_TRANS = "#f0a020"
     COLOR_LOAD = "#4080e0"
-    METER_BG = "#2a2a2a"
-    WIDTH = 260
-    HEIGHT = 36
 
-    # Layout del meter
-    METER_X0 = 150
-    METER_X1 = 250
-    METER_Y0 = 13
-    METER_Y1 = 23
+    LED_GREEN = "#28be5c"
+    LED_YELLOW = "#f0c020"
+    LED_RED = "#dc3232"
+    # Mezcla LED-color con BG_PILL al 18% para "LED apagado pero presente"
+    LED_OFF_MIX = 0.18
+
+    HALO_FREQ_HZ = 1.5
+    HALO_ALPHA_MIN = 0.20
+    HALO_ALPHA_MAX = 0.60
+
+    REFRESH_MS = 40
 
     def __init__(self):
         self.root = tk.Tk()
@@ -224,8 +323,13 @@ class DictadoOverlay:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-toolwindow", True)
-        self.root.attributes("-alpha", 0.92)
-        self.root.configure(bg=self.BG)
+        # Alpha global de la ventana (afecta toda la pildora). Mas bajo que antes
+        # para sensacion glass.
+        self.root.attributes("-alpha", 0.85)
+        # transparentcolor: cualquier pixel exactamente igual a este color se
+        # vuelve invisible. Permite esquinas redondeadas sobre cualquier fondo.
+        self.root.wm_attributes("-transparentcolor", self.TRANSPARENT_KEY)
+        self.root.configure(bg=self.TRANSPARENT_KEY)
 
         # Posicion: centro superior de la pantalla
         sw = self.root.winfo_screenwidth()
@@ -235,98 +339,204 @@ class DictadoOverlay:
 
         self.canvas = tk.Canvas(
             self.root, width=self.WIDTH, height=self.HEIGHT,
-            highlightthickness=0, bg=self.BG,
+            highlightthickness=0, bg=self.TRANSPARENT_KEY, borderwidth=0,
         )
         self.canvas.pack()
 
-        self._dot = self.canvas.create_oval(10, 12, 26, 28, fill=self.COLOR_IDLE, outline="")
-        self._label = self.canvas.create_text(
-            36, self.HEIGHT // 2, anchor="w",
-            text="Listo", fill="white", font=("Segoe UI", 10, "bold"),
-        )
+        # Todo el render es una sola imagen Pillow que reemplazamos cada frame.
+        self._image_id = self.canvas.create_image(0, 0, anchor="nw")
+        self._photo = None  # mantener referencia para que Tk no la garbage-collectee
 
-        # VU meter: fondo + barra de fill que crece con el nivel
-        self._meter_bg = self.canvas.create_rectangle(
-            self.METER_X0, self.METER_Y0, self.METER_X1, self.METER_Y1,
-            fill=self.METER_BG, outline="",
-        )
-        self._meter_fill = self.canvas.create_rectangle(
-            self.METER_X0, self.METER_Y0, self.METER_X0, self.METER_Y1,
-            fill=self.COLOR_IDLE, outline="",
-        )
+        # Cache de render: si el key no cambio, no repintamos.
+        self._last_key = None
 
-        # Estado interno del meter
-        self._level_source = None  # callable que devuelve float [0,1]
-        self._meter_running = False
+        # Fuente: Segoe UI Bold a SUPERSAMPLE x para AA al downscale.
+        # Si falla, fallback al default de Pillow (mas feo pero no crashea).
+        self._font = self._load_font(self.LABEL_FONT_SIZE * self.SUPERSAMPLE)
+
+        # Precomputar colores RGB y los "off" de cada LED
+        self._bg_rgb = _hex_to_rgb(self.BG_PILL)
+        self._led_colors = self._precompute_led_colors()
+
+        # Estado
         self._estado = "idle"
+        self._level = 0.0
+        self._level_source = None
+        self._loop_running = False
 
         self.set_state("idle")
 
+    # ── Carga de fuente ──────────────────────────────────────────
+
+    def _load_font(self, size):
+        candidates = [
+            "C:/Windows/Fonts/segoeuib.ttf",  # Segoe UI Bold
+            "C:/Windows/Fonts/seguisb.ttf",   # Segoe UI Semibold
+            "C:/Windows/Fonts/arialbd.ttf",   # Arial Bold
+        ]
+        for path in candidates:
+            try:
+                return ImageFont.truetype(path, size)
+            except (OSError, IOError):
+                continue
+        return ImageFont.load_default()
+
+    # ── Precompute LED colors ────────────────────────────────────
+
+    def _precompute_led_colors(self):
+        """Para cada uno de los 10 LEDs, precalcula color encendido y apagado."""
+        result = []
+        for i in range(self.LED_COUNT):
+            if i < 4:
+                on = _hex_to_rgb(self.LED_GREEN)
+            elif i < 7:
+                on = _hex_to_rgb(self.LED_YELLOW)
+            else:
+                on = _hex_to_rgb(self.LED_RED)
+            off = _lerp_rgb(self._bg_rgb, on, self.LED_OFF_MIX)
+            result.append((on, off))
+        return result
+
+    # ── API publica ──────────────────────────────────────────────
+
     def bind_level_source(self, getter):
-        """Registrar una funcion callable que devuelve el nivel actual [0,1]."""
         self._level_source = getter
 
-    def set_state(self, estado):
+    def set_state(self, estado, preview=None):
         """Estados: idle, cargando, grabando, transcribiendo."""
-        mapping = {
-            "idle": (self.COLOR_IDLE, "Listo"),
-            "cargando": (self.COLOR_LOAD, "Cargando modelo..."),
-            "grabando": (self.COLOR_REC, "Grabando..."),
-            "transcribiendo": (self.COLOR_TRANS, "Transcribiendo..."),
-        }
-        color, texto = mapping.get(estado, (self.COLOR_IDLE, "Listo"))
-        self.canvas.itemconfig(self._dot, fill=color)
-        self.canvas.itemconfig(self._label, text=texto)
+        if estado not in ("idle", "cargando", "grabando", "transcribiendo"):
+            estado = "idle"
         self._estado = estado
 
-        # En idle ocultamos la ventana para no distraer
         if estado == "idle":
-            self.set_level(0.0)
-            self._meter_running = False
+            self._level = 0.0
+            self._loop_running = False
             self.root.withdraw()
-        else:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.attributes("-topmost", True)
-
-        # Solo mostramos el meter activo durante grabacion
-        if estado == "grabando":
-            if not self._meter_running:
-                self._meter_running = True
-                self._refresh_level_loop()
-        else:
-            self._meter_running = False
-            if estado != "idle":
-                self.set_level(0.0)
-
-    def set_level(self, level):
-        """level ∈ [0,1] -> redimensiona el fill y le asigna color segun el rango."""
-        level = max(0.0, min(1.0, level))
-        x0 = self.METER_X0
-        x1 = x0 + int((self.METER_X1 - self.METER_X0) * level)
-        self.canvas.coords(
-            self._meter_fill, x0, self.METER_Y0, x1, self.METER_Y1,
-        )
-
-        if level < 0.05:
-            color = "#3a3a3a"   # gris: casi silencio
-        elif level < 0.40:
-            color = "#28be5c"   # verde: OK
-        elif level < 0.80:
-            color = "#f0c020"   # amarillo: alto
-        else:
-            color = "#dc3232"   # rojo: clipping
-        self.canvas.itemconfig(self._meter_fill, fill=color)
-
-    def _refresh_level_loop(self):
-        """Corre cada 40ms mientras estado == grabando, leyendo _level_source."""
-        if not self._meter_running or self._level_source is None:
             return
-        try:
-            self.set_level(self._level_source())
-        except Exception:
-            pass
-        self.root.after(40, self._refresh_level_loop)
+
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+
+        # Lanzar loop si no estaba corriendo
+        if not self._loop_running:
+            self._loop_running = True
+            self._refresh_loop()
+        else:
+            # Fuerza un repaint inmediato para que el cambio de estado se vea ya
+            self._last_key = None
+            self._paint()
+
+    # ── Loop de refresco ─────────────────────────────────────────
+
+    def _refresh_loop(self):
+        if not self._loop_running:
+            return
+        # Leer level si estamos grabando; en otros estados no hace falta
+        if self._estado == "grabando" and self._level_source is not None:
+            try:
+                self._level = float(self._level_source())
+            except Exception:
+                self._level = 0.0
+        else:
+            self._level = 0.0
+
+        self._paint()
+        self.root.after(self.REFRESH_MS, self._refresh_loop)
+
+    # ── Cache + paint ────────────────────────────────────────────
+
+    def _paint(self):
+        """Renderiza si el cache key cambio. Llamado cada REFRESH_MS."""
+        # Bucket del nivel a 0.05 (20 niveles) -> evita repaints excesivos
+        level_bucket = round(min(1.0, max(0.0, self._level)) * 20)
+        # Bucket de la fase del halo: 16 buckets/ciclo, solo cuenta si grabando
+        if self._estado == "grabando":
+            halo_phase = (time.time() * self.HALO_FREQ_HZ) % 1.0
+            halo_bucket = round(halo_phase * 16) % 16
+        else:
+            halo_phase = 0.0
+            halo_bucket = -1
+
+        key = (self._estado, level_bucket, halo_bucket)
+        if key == self._last_key:
+            return
+        self._last_key = key
+
+        img = self._render(self._level, halo_phase)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.itemconfig(self._image_id, image=self._photo)
+
+    # ── Render Pillow ────────────────────────────────────────────
+
+    def _render(self, level, halo_phase):
+        SS = self.SUPERSAMPLE
+        W = self.WIDTH * SS
+        H = self.HEIGHT * SS
+        R = self.PILL_RADIUS * SS
+
+        # Fondo del canvas = transparent_key. Lo que dibujemos encima en BG_PILL
+        # u otro color sera lo unico visible.
+        img = Image.new("RGB", (W, H), self.TRANSPARENT_KEY)
+        d = ImageDraw.Draw(img)
+
+        # ── Pildora (rect redondeado) ────────────────────────
+        d.rounded_rectangle((0, 0, W - 1, H - 1), radius=R, fill=self.BG_PILL)
+
+        # ── Color y texto del estado ─────────────────────────
+        state_color_hex, label_text = {
+            "cargando":      (self.COLOR_LOAD,  "Cargando modelo..."),
+            "grabando":      (self.COLOR_REC,   "Grabando..."),
+            "transcribiendo":(self.COLOR_TRANS, "Transcribiendo..."),
+        }.get(self._estado, (self.COLOR_IDLE, ""))
+        state_color = _hex_to_rgb(state_color_hex)
+
+        # ── Halo pulsante (solo grabando) ────────────────────
+        cx = self.DOT_CX * SS
+        cy = self.DOT_CY * SS
+        if self._estado == "grabando":
+            # alpha visible oscila como semi-seno entre min y max
+            t = 0.5 + 0.5 * math.sin(halo_phase * 2 * math.pi)
+            alpha = self.HALO_ALPHA_MIN + (self.HALO_ALPHA_MAX - self.HALO_ALPHA_MIN) * t
+            halo_color = _lerp_rgb(self._bg_rgb, state_color, alpha)
+            hr = self.HALO_R * SS
+            d.ellipse((cx - hr, cy - hr, cx + hr, cy + hr), fill=halo_color)
+
+        # ── Dot solido ───────────────────────────────────────
+        dr = self.DOT_R * SS
+        d.ellipse((cx - dr, cy - dr, cx + dr, cy + dr), fill=state_color)
+
+        # ── Texto ────────────────────────────────────────────
+        if label_text:
+            d.text(
+                (self.LABEL_X * SS, H // 2),
+                label_text,
+                fill=(255, 255, 255),
+                font=self._font,
+                anchor="lm",
+            )
+
+        # ── LEDs ─────────────────────────────────────────────
+        # Solo "vivos" en grabando; en otros estados los mostramos apagados (silueta)
+        active_level = level if self._estado == "grabando" else 0.0
+        for i, (on_color, off_color) in enumerate(self._led_colors):
+            x_left = (self.LED_X0 + i * (self.LED_W + self.LED_GAP)) * SS
+            x_right = x_left + self.LED_W * SS
+            y_top = self.LED_Y0 * SS
+            y_bot = self.LED_Y1 * SS
+            # Threshold: el LED i se enciende cuando level >= (i+1)/LED_COUNT
+            on = active_level >= (i + 1) / self.LED_COUNT
+            color = on_color if on else off_color
+            d.rounded_rectangle(
+                (x_left, y_top, x_right, y_bot),
+                radius=self.LED_RADIUS * SS,
+                fill=color,
+            )
+
+        # Downscale con LANCZOS para AA limpio
+        if SS != 1:
+            img = img.resize((self.WIDTH, self.HEIGHT), Image.LANCZOS)
+        return img
 
 
 class MicDictado:
@@ -345,9 +555,18 @@ class MicDictado:
         self._current_level = 0.0
         self.overlay.bind_level_source(lambda: self._current_level)
 
+        # Ducking de musica: bajamos volumen en _start_recording, restauramos
+        # apenas termina la transcripcion.
+        self.ducker = AudioDucker()
+
+        # Ultimo texto transcripto (auto-pegado siempre, pero queda guardado por si
+        # el usuario quiere re-pegar con Ctrl+Shift+Space en otro lugar)
+        self._last_text = None
+
         # Modelo Whisper: carga en hilo daemon para no bloquear el arranque de Tk.
         # La primera vez descarga ~470 MB a MODEL_DIR. Luego queda cacheado.
         self.model = None
+        self._loaded_model_name = None
         self._model_ready = False
         self.overlay.set_state("cargando")
         threading.Thread(target=self._load_model, daemon=True).start()
@@ -359,12 +578,14 @@ class MicDictado:
     def _load_model(self):
         try:
             os.makedirs(MODEL_DIR, exist_ok=True)
-            print(f"[MicDictado] cargando modelo '{MODEL_NAME}' en {MODEL_DIR}...")
+            model_name = settings.model_name
+            print(f"[MicDictado] cargando modelo '{model_name}' en {MODEL_DIR}...")
             t0 = time.time()
             self.model = WhisperModel(
-                MODEL_NAME, device="cpu", compute_type="int8",
+                model_name, device="cpu", compute_type="int8",
                 download_root=MODEL_DIR,
             )
+            self._loaded_model_name = model_name
             self._model_ready = True
             print(f"[MicDictado] modelo listo en {time.time() - t0:.1f}s")
             self.overlay.root.after(0, self.overlay.set_state, "idle")
@@ -372,6 +593,14 @@ class MicDictado:
             print(f"[MicDictado] error cargando modelo: {e}")
             import traceback
             traceback.print_exc()
+
+    def reload_model_if_needed(self):
+        """Si el settings.model_name cambio, recarga el modelo en background."""
+        if getattr(self, "_loaded_model_name", None) == settings.model_name:
+            return
+        self._model_ready = False
+        self.overlay.root.after(0, self.overlay.set_state, "cargando")
+        threading.Thread(target=self._load_model, daemon=True).start()
 
     def _com_call(self, accion):
         """Ejecuta accion(self.volume) con retry tras fallo de COM.
@@ -383,17 +612,48 @@ class MicDictado:
             return accion(self.volume)
 
     def _listen_hotkey(self):
-        """Escucha Ctrl+Shift+F11 via RegisterHotKey."""
-        ctypes.windll.user32.RegisterHotKey(
-            None, HOTKEY_ID, MOD_CTRL | MOD_SHIFT, VK_F11
-        )
+        """Escucha hotkeys: F11 toggle, Shift+Space re-pegar ultimo, F9 abrir Settings."""
+        u32 = ctypes.windll.user32
+        # Registramos los 3 hotkeys y avisamos si alguno fallo (otra app lo tomo).
+        # RegisterHotKey devuelve 0 si la combinacion ya esta tomada globalmente.
+        for hid, vk, label in (
+            (HOTKEY_ID_TOGGLE, VK_F11, "Ctrl+Shift+F11 (toggle)"),
+            (HOTKEY_ID_REPASTE, VK_SPACE, "Ctrl+Shift+Space (re-pegar)"),
+            (HOTKEY_ID_SETTINGS, VK_F9, "Ctrl+Shift+F9 (settings)"),
+        ):
+            ok = u32.RegisterHotKey(None, hid, MOD_CTRL | MOD_SHIFT, vk)
+            if not ok:
+                print(f"[MicDictado] WARNING: hotkey {label} ya esta tomado por otra app, no funcionara")
         msg = wintypes.MSG()
-        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
-            if msg.message == 0x0312:  # WM_HOTKEY
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0):
+            if msg.message != 0x0312:  # WM_HOTKEY
+                continue
+            hid = msg.wParam
+            if hid == HOTKEY_ID_TOGGLE:
                 self.overlay.root.after(0, self._toggle)
+            elif hid == HOTKEY_ID_REPASTE:
+                self.overlay.root.after(0, self._repaste_last)
+            elif hid == HOTKEY_ID_SETTINGS:
+                self.overlay.root.after(0, self._open_settings_via_hotkey)
+
+    def _open_settings_via_hotkey(self):
+        """Abre la ventana de Configuracion desde el hotkey, sin depender del tray."""
+        try:
+            from tray import SettingsWindow
+            existing = getattr(self, "_settings_window", None)
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+            self._settings_window = SettingsWindow(self)
+        except Exception as e:
+            print(f"[MicDictado] error abriendo Settings: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _toggle(self):
-        """Alterna grabacion. Si el modelo aun no esta cargado, ignora el disparo."""
+        """F11: alterna grabacion."""
         if not self._model_ready:
             print("[MicDictado] modelo aun cargando, ignorando disparo")
             self.overlay.set_state("cargando")
@@ -403,6 +663,22 @@ class MicDictado:
         else:
             self._start_recording()
 
+    def _repaste_last(self):
+        """Ctrl+Shift+Space: re-pega el ultimo texto transcripto donde este el cursor.
+
+        El _last_text NO se borra: se puede re-pegar varias veces en distintos lugares."""
+        if not self._last_text:
+            print("[MicDictado] no hay texto previo para re-pegar")
+            return
+        print(f"[MicDictado] re-pegando ultimo texto ({len(self._last_text)} chars)")
+        # Soltar Ctrl+Shift virtualmente: el WM_HOTKEY llego con esos modificadores
+        # fisicamente pulsados, y sin esto las primeras letras se interpretan como
+        # atajos (Ctrl+B, Ctrl+S...) en la app destino y se "come" parte del texto.
+        _release_modifiers()
+        # Pequeno delay para que la app destino procese el key-up antes de recibir
+        # los caracteres Unicode.
+        self.overlay.root.after(60, lambda: type_text_unicode(self._last_text))
+
     def _audio_callback(self, indata, frames, time_info, status):
         """Callback de sounddevice: appendea chunk int16 al buffer y actualiza VU meter."""
         if status:
@@ -411,11 +687,11 @@ class MicDictado:
             self._audio_buffer.append(indata.copy())
 
         # Calcular RMS del chunk (normalizado int16 -> float [0,1]) para el VU meter.
-        # Multiplicamos x4 porque voz normal suele dar RMS ~0.05-0.15; asi la barra
-        # tiene rango util sin que haya que gritar para llegar a amarillo.
+        # La ganancia es configurable (settings.vu_gain). Voz normal da RMS ~0.05-0.15;
+        # con default 7.0 la barra llega a verde alto sin gritar.
         chunk_f = indata.astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(chunk_f ** 2)))
-        self._current_level = min(rms * 4.0, 1.0)
+        self._current_level = min(rms * settings.vu_gain, 1.0)
 
     def _start_recording(self):
         try:
@@ -423,6 +699,12 @@ class MicDictado:
             self._mute_previo = bool(self._com_call(lambda v: v.GetMute()))
             if self._mute_previo:
                 self._com_call(lambda v: v.SetMute(False, None))
+
+            # Bajar volumen de Spotify/YouTube/etc. mientras dictamos
+            try:
+                self.ducker.duck()
+            except Exception as e:
+                print(f"[MicDictado] error al duckear: {e}")
 
             # Buffer limpio y abrir stream
             with self._buffer_lock:
@@ -442,6 +724,10 @@ class MicDictado:
         except Exception as e:
             print(f"[MicDictado] error al iniciar grabacion: {e}")
             self.overlay.set_state("idle")
+            try:
+                self.ducker.restore()
+            except Exception:
+                pass
 
     def _stop_recording(self):
         try:
@@ -459,6 +745,13 @@ class MicDictado:
                     self._com_call(lambda v: v.SetMute(True, None))
             except Exception as e:
                 print(f"[MicDictado] error restaurando mute: {e}")
+
+            # Restaurar volumen de musica YA: el usuario solto el hotkey y quiere
+            # escuchar de nuevo mientras la transcripcion corre en background.
+            try:
+                self.ducker.restore()
+            except Exception as e:
+                print(f"[MicDictado] error al restaurar ducking: {e}")
 
             # Procesar buffer en hilo separado para no bloquear Tk
             threading.Thread(target=self._procesar_audio, daemon=True).start()
@@ -493,24 +786,36 @@ class MicDictado:
             segments, info = self.model.transcribe(
                 audio_f32,
                 language=MODEL_LANG,
-                beam_size=5,
+                beam_size=settings.beam_size,
+                vad_filter=settings.vad_filter,
             )
             # segments es un generator; consumirlo materializa la transcripcion
             texto = " ".join(seg.text.strip() for seg in segments).strip()
             elapsed = time.time() - t0
             print(f"[MicDictado] transcripcion ({elapsed:.1f}s): {texto!r}")
 
-            # Tipear el texto donde esta el cursor (Unicode via SendInput,
-            # funciona en cualquier app incluyendo terminales)
-            if texto:
-                type_text_unicode(texto)
+            # NOTA: el restore del ducking ya se hizo en _stop_recording, apenas
+            # el usuario solto el hotkey. Aca no hace falta tocarlo en el caso happy path.
+
+            if not texto:
+                return
+
+            # Auto-pegado donde este el cursor (SendInput Unicode).
+            # Guardamos el texto en _last_text por si el usuario quiere re-pegarlo
+            # con Ctrl+Shift+Space (caso tipico: perdio el foco antes del pegado).
+            self._last_text = texto
+            type_text_unicode(texto)
         except Exception as e:
             print(f"[MicDictado] error procesando audio: {e}")
             import traceback
             traceback.print_exc()
+            # Defensivo: si por alguna razon llegamos aca con la musica todavia
+            # baja (ej. crash entre _stop_recording y aca), restauramos.
+            try:
+                self.ducker.restore()
+            except Exception:
+                pass
         finally:
-            # El mute ya fue restaurado en _stop_recording, antes de empezar a
-            # transcribir, para que el remute sea inmediato al soltar el hotkey.
             self.overlay.root.after(0, self.overlay.set_state, "idle")
 
     def run(self):
@@ -520,7 +825,16 @@ class MicDictado:
 if __name__ == "__main__":
     try:
         app = MicDictado()
-        print("MicDictado iniciado. Ctrl+Shift+F11 para toggle.")
+
+        # Tray icon en hilo daemon (menu Toggle / Configuracion / Salir)
+        from tray import TrayIcon
+        tray = TrayIcon(app)
+        tray.start()
+
+        print("MicDictado iniciado.")
+        print("  Ctrl+Shift+F11    = toggle grabacion (auto-pega al terminar)")
+        print("  Ctrl+Shift+Space  = re-pegar el ultimo texto donde este el cursor")
+        print("  Ctrl+Shift+F9     = abrir ventana de Configuracion")
         app.run()
     except Exception as e:
         print(f"ERROR: {e}")

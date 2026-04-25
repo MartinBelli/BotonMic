@@ -29,6 +29,10 @@ a = Analysis(
     hiddenimports=(
         fw_hidden + ct_hidden + tk_hidden + ort_hidden
         + ['ctranslate2', 'tokenizers']
+        # Backends de pystray para Windows
+        + ['pystray._win32', 'pystray._base']
+        # Modulos propios cargados via 'from ... import ...' a nivel de funcion
+        + ['settings', 'audio_ducker', 'tray']
     ),
     hookspath=[],
     hooksconfig={},
