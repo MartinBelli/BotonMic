@@ -11,6 +11,8 @@ Requiere: pip install -r requirements.txt
 
 import atexit
 import ctypes
+import datetime
+import json
 import math
 import os
 import subprocess
@@ -59,6 +61,15 @@ MODEL_DIR = os.path.join(
     "MicDictado", "models",
 )
 MODEL_LANG = "es"
+
+# ── Historial de transcripciones ────────────────────────────────
+# JSONL append-only en LOCALAPPDATA. Cuando supera settings.history_max_entries,
+# se trunca dejando solo las ultimas N. Privacidad: 100% local, texto plano.
+APP_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+    "MicDictado",
+)
+TRANSCRIPTS_FILE = os.path.join(APP_DATA_DIR, "transcripts.jsonl")
 
 # ── Single-instance: kill + replace via lockfile con PID ────────
 # Si ya hay una instancia corriendo, la matamos y nos quedamos con la nueva.
@@ -594,6 +605,42 @@ class MicDictado:
             import traceback
             traceback.print_exc()
 
+    def _log_transcript(self, texto, duracion_s, elapsed_s, initial_prompt):
+        """Appendea una linea JSON a transcripts.jsonl. Si supera el limite,
+        trunca dejando solo las ultimas N entradas.
+
+        Diseñado para ser robusto: cualquier error de I/O se loggea y se ignora,
+        nunca debe romper el flujo de transcripcion."""
+        try:
+            os.makedirs(APP_DATA_DIR, exist_ok=True)
+            entry = {
+                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "model": self._loaded_model_name or settings.model_name,
+                "beam_size": settings.beam_size,
+                "vad_filter": bool(settings.vad_filter),
+                "duracion_s": round(float(duracion_s), 2),
+                "elapsed_s": round(float(elapsed_s), 2),
+                "initial_prompt": initial_prompt or "",
+                "texto": texto,
+            }
+            line = json.dumps(entry, ensure_ascii=False) + "\n"
+            with open(TRANSCRIPTS_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+
+            # Rotacion: si supera el limite, releer todo y truncar.
+            # Aceptamos el costo O(N) porque N tipico es 500 = ~lineas, nada.
+            max_entries = max(1, int(settings.history_max_entries))
+            with open(TRANSCRIPTS_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > max_entries:
+                kept = lines[-max_entries:]
+                tmp = TRANSCRIPTS_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(kept)
+                os.replace(tmp, TRANSCRIPTS_FILE)
+        except OSError as e:
+            print(f"[MicDictado] error escribiendo historial: {e}")
+
     def reload_model_if_needed(self):
         """Si el settings.model_name cambio, recarga el modelo en background."""
         if getattr(self, "_loaded_model_name", None) == settings.model_name:
@@ -783,16 +830,27 @@ class MicDictado:
 
             print(f"[MicDictado] transcribiendo {duracion:.2f}s de audio...")
             t0 = time.time()
+            initial_prompt = (settings.initial_prompt or "").strip() or None
             segments, info = self.model.transcribe(
                 audio_f32,
                 language=MODEL_LANG,
                 beam_size=settings.beam_size,
                 vad_filter=settings.vad_filter,
+                initial_prompt=initial_prompt,
             )
             # segments es un generator; consumirlo materializa la transcripcion
             texto = " ".join(seg.text.strip() for seg in segments).strip()
             elapsed = time.time() - t0
             print(f"[MicDictado] transcripcion ({elapsed:.1f}s): {texto!r}")
+
+            # Persistir en historial (solo si esta habilitado y hay texto util)
+            if texto and settings.history_enabled:
+                self._log_transcript(
+                    texto=texto,
+                    duracion_s=duracion,
+                    elapsed_s=elapsed,
+                    initial_prompt=initial_prompt,
+                )
 
             # NOTA: el restore del ducking ya se hizo en _stop_recording, apenas
             # el usuario solto el hotkey. Aca no hace falta tocarlo en el caso happy path.

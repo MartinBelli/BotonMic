@@ -9,14 +9,25 @@ Los callbacks del tray corren en el hilo de pystray, asi que cualquier accion
 que toque tkinter se posterga via overlay.root.after(0, ...).
 """
 
+import os
+import subprocess
+import tempfile
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import pystray
 from PIL import Image, ImageDraw
 
-from settings import settings, DEFAULTS
+from settings import settings, DEFAULTS, DEFAULT_INITIAL_PROMPT
+
+
+# Misma carpeta que usa mic_dictado.py para el historial
+_APP_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+    "MicDictado",
+)
+_TRANSCRIPTS_FILE = os.path.join(_APP_DATA_DIR, "transcripts.jsonl")
 
 
 def _make_icon_image():
@@ -170,6 +181,69 @@ class SettingsWindow(tk.Toplevel):
             command=self._on_beam_change,
         ).grid(row=6, column=1, sticky="w", pady=4)
 
+        ttk.Label(
+            f_trans,
+            text="Vocabulario / contexto (initial_prompt):",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
+        ttk.Label(
+            f_trans,
+            text="Sesga al modelo hacia palabras escritas así. Ideal para nombres, marcas, jerga.",
+            foreground="#666666",
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+
+        # Frame contenedor para Text + Scrollbar (tk.Text no es ttk)
+        f_prompt = ttk.Frame(f_trans)
+        f_prompt.grid(row=9, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
+        f_prompt.columnconfigure(0, weight=1)
+
+        self.txt_prompt = tk.Text(
+            f_prompt, height=5, wrap="word", font=("Segoe UI", 9),
+            relief="solid", borderwidth=1,
+        )
+        self.txt_prompt.insert("1.0", settings.initial_prompt or "")
+        self.txt_prompt.grid(row=0, column=0, sticky="ew")
+        scroll_prompt = ttk.Scrollbar(f_prompt, orient="vertical", command=self.txt_prompt.yview)
+        scroll_prompt.grid(row=0, column=1, sticky="ns")
+        self.txt_prompt.configure(yscrollcommand=scroll_prompt.set)
+
+        ttk.Button(
+            f_trans, text="Restaurar default",
+            command=self._on_restore_prompt,
+        ).grid(row=10, column=0, sticky="w", padx=8, pady=(2, 6))
+
+        f_trans.columnconfigure(1, weight=1)
+
+        # ── Historial ──
+        f_hist = ttk.LabelFrame(self, text="Historial de transcripciones")
+        f_hist.pack(fill="x", **pad)
+        self.var_hist_on = tk.BooleanVar(value=bool(settings.history_enabled))
+        ttk.Checkbutton(
+            f_hist, text="Guardar historial local (texto plano, sin audio)",
+            variable=self.var_hist_on, command=self._on_hist_toggle,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=2)
+
+        ttk.Label(f_hist, text="Mantener últimas:").grid(
+            row=1, column=0, sticky="w", padx=8, pady=4
+        )
+        self.var_hist_max = tk.IntVar(value=int(settings.history_max_entries))
+        ttk.Spinbox(
+            f_hist, from_=50, to=10000, increment=50, width=8,
+            textvariable=self.var_hist_max,
+            command=self._on_hist_max_change,
+        ).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(f_hist, text="transcripciones").grid(row=1, column=2, sticky="w", padx=4)
+
+        f_hist_btns = ttk.Frame(f_hist)
+        f_hist_btns.grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
+        ttk.Button(
+            f_hist_btns, text="Abrir carpeta",
+            command=self._on_open_history_folder,
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            f_hist_btns, text="Borrar historial",
+            command=self._on_clear_history,
+        ).pack(side="left")
+
         # ── Hotkeys (referencia) ──
         f_keys = ttk.LabelFrame(self, text="Hotkeys")
         f_keys.pack(fill="x", **pad)
@@ -214,16 +288,62 @@ class SettingsWindow(tk.Toplevel):
         except (ValueError, tk.TclError):
             pass
 
+    def _on_restore_prompt(self):
+        self.txt_prompt.delete("1.0", "end")
+        self.txt_prompt.insert("1.0", DEFAULT_INITIAL_PROMPT)
+
+    def _on_hist_toggle(self):
+        settings.update(history_enabled=bool(self.var_hist_on.get()))
+
+    def _on_hist_max_change(self):
+        try:
+            v = max(1, int(self.var_hist_max.get()))
+            settings.update(history_max_entries=v)
+        except (ValueError, tk.TclError):
+            pass
+
+    def _on_open_history_folder(self):
+        try:
+            os.makedirs(_APP_DATA_DIR, exist_ok=True)
+            # explorer.exe abre la carpeta en una ventana del Explorador
+            subprocess.Popen(["explorer.exe", _APP_DATA_DIR])
+        except OSError as e:
+            messagebox.showerror("Error", f"No pude abrir la carpeta: {e}", parent=self)
+
+    def _on_clear_history(self):
+        if not messagebox.askyesno(
+            "Borrar historial",
+            "¿Borrar todas las transcripciones guardadas?\nEsta acción no se puede deshacer.",
+            parent=self,
+        ):
+            return
+        try:
+            if os.path.exists(_TRANSCRIPTS_FILE):
+                os.remove(_TRANSCRIPTS_FILE)
+            messagebox.showinfo("Historial", "Historial borrado.", parent=self)
+        except OSError as e:
+            messagebox.showerror("Error", f"No pude borrar el historial: {e}", parent=self)
+
     # ── Aplicar todo / cerrar ──
 
     def _apply_all(self):
         # Las variables que aplican en vivo ya estan persistidas; aca persistimos las que no:
-        # excluidos del ducking + modelo. El modelo gatilla reload.
+        # excluidos del ducking + modelo + initial_prompt + history_max. El modelo gatilla reload.
         excl_raw = self.var_duck_excl.get().strip()
         excl = [p.strip() for p in excl_raw.split(",") if p.strip()] if excl_raw else []
+
+        prompt_text = self.txt_prompt.get("1.0", "end").strip()
+
+        try:
+            hist_max = max(1, int(self.var_hist_max.get()))
+        except (ValueError, tk.TclError):
+            hist_max = int(DEFAULTS["history_max_entries"])
+
         settings.update(
             ducking_exclude=excl or list(DEFAULTS["ducking_exclude"]),
             model_name=self.var_model.get(),
+            initial_prompt=prompt_text,
+            history_max_entries=hist_max,
         )
         # Forzar persistencia y reload de modelo si cambio
         self.app.reload_model_if_needed()

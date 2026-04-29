@@ -12,6 +12,15 @@ import tempfile
 import threading
 
 
+DEFAULT_INITIAL_PROMPT = (
+    "Transcripción en español argentino. Vocabulario técnico habitual: "
+    "Next.js, React, TypeScript, Tailwind, Vercel, Supabase, Cloudflare, "
+    "Cursor, Claude, Anthropic, Santex, GitHub, pull request, merge, deploy, "
+    "endpoint, middleware, hook, prompt, repo, branch, commit, "
+    "PyInstaller, Whisper, faster-whisper, MicDictado."
+)
+
+
 DEFAULTS = {
     # VU meter
     "vu_gain": 7.0,                  # 1.0 - 15.0 (mas alto = mas sensible)
@@ -31,6 +40,15 @@ DEFAULTS = {
     "model_name": "small",           # tiny | base | small | medium
     "beam_size": 1,                  # 1 = greedy, mas alto = mas preciso/lento
     "vad_filter": True,
+    # initial_prompt: contexto/vocabulario que se le pasa a Whisper como "final
+    # de transcripcion previa". Sesga al modelo hacia palabras escritas asi.
+    # Ideal para nombres propios, marcas, anglicismos tecnicos.
+    # Whisper solo guarda los ultimos ~224 tokens, mantenerlo corto.
+    "initial_prompt": DEFAULT_INITIAL_PROMPT,
+
+    # Historial de transcripciones (texto plano, sin audio)
+    "history_enabled": True,
+    "history_max_entries": 500,
 }
 
 
