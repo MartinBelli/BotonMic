@@ -71,6 +71,20 @@ APP_DATA_DIR = os.path.join(
 )
 TRANSCRIPTS_FILE = os.path.join(APP_DATA_DIR, "transcripts.jsonl")
 
+# ── LLM local (infraestructura para features futuras) ──────────
+# El stack del LLM (carga + funcion de correccion con glosario) quedo armado
+# durante la Fase 1, pero el "modo limpio" como feature general fue descartado
+# (ver plan_escalamiento.md): con initial_prompt expandido, Whisper transcribe
+# bien sin necesidad de post-procesado, y el LLM solo metia alucinaciones.
+# Por eso _load_llm() NO se invoca al arrancar (no gastamos 3 GB de RAM por
+# nada). Cuando se agreguen features especificas (atajos a Slack, reescribir
+# como email formal, etc.), van a invocar _load_llm() de forma lazy en su
+# primer uso.
+LLM_MODEL_PATH = os.path.join(
+    APP_DATA_DIR, "llm", "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+)
+LLM_N_CTX = 2048
+
 # ── Single-instance: kill + replace via lockfile con PID ────────
 # Si ya hay una instancia corriendo, la matamos y nos quedamos con la nueva.
 # Util en desarrollo (no hay que ir al Task Manager) y tambien si quedo zombie.
@@ -315,6 +329,7 @@ class DictadoOverlay:
     COLOR_REC = "#dc3232"
     COLOR_TRANS = "#f0a020"
     COLOR_LOAD = "#4080e0"
+    COLOR_CLEAN = "#9b59b6"  # violeta: estado limpiando (LLM corrigiendo texto)
 
     LED_GREEN = "#28be5c"
     LED_YELLOW = "#f0c020"
@@ -414,8 +429,8 @@ class DictadoOverlay:
         self._level_source = getter
 
     def set_state(self, estado, preview=None):
-        """Estados: idle, cargando, grabando, transcribiendo."""
-        if estado not in ("idle", "cargando", "grabando", "transcribiendo"):
+        """Estados: idle, cargando, grabando, transcribiendo, limpiando."""
+        if estado not in ("idle", "cargando", "grabando", "transcribiendo", "limpiando"):
             estado = "idle"
         self._estado = estado
 
@@ -499,6 +514,7 @@ class DictadoOverlay:
             "cargando":      (self.COLOR_LOAD,  "Cargando modelo..."),
             "grabando":      (self.COLOR_REC,   "Grabando..."),
             "transcribiendo":(self.COLOR_TRANS, "Transcribiendo..."),
+            "limpiando":     (self.COLOR_CLEAN, "Limpiando..."),
         }.get(self._estado, (self.COLOR_IDLE, ""))
         state_color = _hex_to_rgb(state_color_hex)
 
@@ -582,6 +598,14 @@ class MicDictado:
         self.overlay.set_state("cargando")
         threading.Thread(target=self._load_model, daemon=True).start()
 
+        # LLM local: infraestructura lista pero NO se carga al arranque.
+        # Cuando se agreguen features que lo necesiten, deberan invocar
+        # _load_llm() la primera vez (carga lazy). Mantener estos atributos
+        # para que _correct_with_glossary y futuras funciones puedan
+        # consultarlos sin if-around-everything.
+        self.llm = None
+        self._llm_ready = False
+
         # Hotkey en hilo daemon (mismo patron que mic_tray.py:103-109)
         self._hotkey_thread = threading.Thread(target=self._listen_hotkey, daemon=True)
         self._hotkey_thread.start()
@@ -604,6 +628,131 @@ class MicDictado:
             print(f"[MicDictado] error cargando modelo: {e}")
             import traceback
             traceback.print_exc()
+
+    def _load_llm(self):
+        """Carga Llama 3.2 3B Q4 para modo limpio. Best-effort: si falla,
+        el modo limpio queda deshabilitado y el resto sigue funcionando."""
+        if not os.path.exists(LLM_MODEL_PATH):
+            print(f"[MicDictado] LLM no encontrado en {LLM_MODEL_PATH}")
+            print("[MicDictado] modo limpio deshabilitado (Insert -> fallback a crudo)")
+            return
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            print("[MicDictado] llama_cpp no instalado, modo limpio deshabilitado")
+            return
+        try:
+            print(f"[MicDictado] cargando LLM Llama 3.2 3B Q4 ({LLM_MODEL_PATH})...")
+            t0 = time.time()
+            self.llm = Llama(
+                model_path=LLM_MODEL_PATH,
+                n_ctx=LLM_N_CTX,
+                n_threads=os.cpu_count(),
+                n_gpu_layers=-1,  # ignorado si la build no tiene CUDA
+                verbose=False,
+            )
+            self._llm_ready = True
+            print(f"[MicDictado] LLM listo en {time.time() - t0:.1f}s")
+        except Exception as e:
+            print(f"[MicDictado] error cargando LLM: {e}")
+            # No es critico: el dictado crudo sigue funcionando.
+
+    def _correct_with_glossary(self, texto):
+        """Pasa el texto crudo de Whisper por el LLM con prompt estricto.
+
+        El glosario sale de settings.initial_prompt (mismo vocabulario que
+        sesga a Whisper). El prompt prohibe explicitamente reescritura,
+        agregados o reformulacion: solo correccion de terminos y tildes.
+
+        Devuelve (texto_final, ok). Si el LLM no esta listo o falla,
+        ok=False y texto_final=texto_crudo (fallback transparente).
+
+        Anti-patron prevenido: modelos pequenos (3B) tienden a leer el
+        system prompt como 'instrucciones para el siguiente turno' y
+        responden con saludos / pedidos de aclaracion. Para evitarlo:
+          - el system aclara explicitamente que la respuesta DEBE ser
+            unicamente el texto corregido, sin saludos ni preguntas;
+          - el user message lleva un prefijo 'Texto a corregir:' que
+            elimina ambiguedad sobre que es input."""
+        if not self._llm_ready or self.llm is None:
+            return texto, False
+        glosario = (settings.initial_prompt or "").strip() or "(sin glosario configurado)"
+        system = (
+            "Sos un corrector automatico de transcripciones de voz en espanol. "
+            "El usuario te envia UN solo mensaje con el texto a corregir. "
+            "Tu unica respuesta es ese mismo texto, ya corregido.\n"
+            "\n"
+            "Tarea:\n"
+            "1. Corregir terminos del glosario que esten mal escritos.\n"
+            "2. Aplicar tildes y puntuacion que falten claramente.\n"
+            "3. Si no hay nada para corregir, devolver el texto IDENTICO.\n"
+            "\n"
+            "REGLAS ABSOLUTAS:\n"
+            "- NO saludes, NO te presentes, NO hagas preguntas.\n"
+            "- NO pidas mas informacion. El glosario ya esta abajo.\n"
+            "- NO reescribas, NO reformules, NO cambies el tono.\n"
+            "- NO agregues palabras o ideas que no esten en el original.\n"
+            "- NO cambies el orden de las ideas, NO completes pensamientos.\n"
+            "- NO toques los numeros: '4.2', '1.8', '3.2' van con punto, NO con coma.\n"
+            "- NO uses comillas, backticks, ni prefijos como 'Texto corregido:'.\n"
+            "- Si dudas, no toques: devolve el texto tal cual.\n"
+            "\n"
+            "EJEMPLO 1\n"
+            "Entrada:\n"
+            "Reunion del 14 de marzo. Martin Beshi presento Mic Dictada a Santex Group. Vamos a usar Whisper con Lama 3.2 y Tool Calling.\n"
+            "Salida:\n"
+            "Reunión del 14 de marzo. Martin Belli presentó MicDictado a Santex Group. Vamos a usar Whisper con Llama 3.2 y tool calling.\n"
+            "\n"
+            "EJEMPLO 2 (sin cambios necesarios)\n"
+            "Entrada:\n"
+            "che, llegue tarde, te aviso cuando salgo.\n"
+            "Salida:\n"
+            "Che, llegué tarde, te aviso cuando salgo.\n"
+            "\n"
+            "EJEMPLO 3 (mantener numeros)\n"
+            "Entrada:\n"
+            "La latencia bajo de 4.2 a 1.8 segundos en una RTX 2060.\n"
+            "Salida:\n"
+            "La latencia bajó de 4.2 a 1.8 segundos en una RTX 2060.\n"
+            "\n"
+            f"Glosario de terminos correctos:\n{glosario}"
+        )
+        # Prefijo en el user message: elimina la ambiguedad de 'es esto el texto
+        # o un saludo'. Tambien sirve como ancla para que el modelo no incluya
+        # el prefijo en su respuesta (sabe que eso es input, no output).
+        user_msg = f"Texto a corregir:\n{texto}"
+        try:
+            t0 = time.time()
+            # Presupuesto de tokens: tamano del input + margen razonable.
+            # Aprox 1 token ~= 4 caracteres en espanol.
+            max_tokens = max(128, int(len(texto) / 3) + 80)
+            out = self.llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.0,
+            )
+            respuesta = out["choices"][0]["message"]["content"].strip()
+            # Cleanup: el modelo a veces envuelve la salida en comillas o backticks
+            # pese a la instruccion. Pelamos esos casos comunes.
+            if len(respuesta) >= 2 and respuesta[0] == respuesta[-1] and respuesta[0] in ('"', "'"):
+                respuesta = respuesta[1:-1].strip()
+            if respuesta.startswith("```") and respuesta.endswith("```"):
+                respuesta = respuesta.strip("`").strip()
+            # Defensa adicional: si el modelo igual respondio con prefijo
+            # 'Texto corregido:' o similar, quitarlo.
+            for prefijo in ("Texto corregido:", "Texto a corregir:", "Correccion:", "Corrección:"):
+                if respuesta.lower().startswith(prefijo.lower()):
+                    respuesta = respuesta[len(prefijo):].strip()
+                    break
+            elapsed = time.time() - t0
+            print(f"[MicDictado] correccion LLM ({elapsed:.1f}s): {respuesta!r}")
+            return respuesta or texto, True
+        except Exception as e:
+            print(f"[MicDictado] error en correccion LLM: {e}")
+            return texto, False
 
     def _log_transcript(self, texto, duracion_s, elapsed_s, initial_prompt):
         """Appendea una linea JSON a transcripts.jsonl. Si supera el limite,

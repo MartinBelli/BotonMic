@@ -21,14 +21,23 @@ try:
 except Exception:
     ort_datas, ort_binaries, ort_hidden = [], [], []
 
+# llama-cpp-python: backend del modo limpio. Trae libllama / libggml (DLLs)
+# y se importa lazy dentro de mic_dictado.py, asi que necesitamos collect_all
+# para que PyInstaller no se lo pierda. El modelo GGUF NO va en el exe;
+# vive en %LOCALAPPDATA%\MicDictado\llm\.
+try:
+    llm_datas, llm_binaries, llm_hidden = collect_all('llama_cpp')
+except Exception:
+    llm_datas, llm_binaries, llm_hidden = [], [], []
+
 a = Analysis(
     ['mic_dictado.py'],
     pathex=[],
-    binaries=fw_binaries + ct_binaries + tk_binaries + sd_binaries + ort_binaries,
-    datas=fw_datas + ct_datas + tk_datas + sd_datas + ort_datas,
+    binaries=fw_binaries + ct_binaries + tk_binaries + sd_binaries + ort_binaries + llm_binaries,
+    datas=fw_datas + ct_datas + tk_datas + sd_datas + ort_datas + llm_datas,
     hiddenimports=(
-        fw_hidden + ct_hidden + tk_hidden + ort_hidden
-        + ['ctranslate2', 'tokenizers']
+        fw_hidden + ct_hidden + tk_hidden + ort_hidden + llm_hidden
+        + ['ctranslate2', 'tokenizers', 'llama_cpp']
         # Backends de pystray para Windows
         + ['pystray._win32', 'pystray._base']
         # Modulos propios cargados via 'from ... import ...' a nivel de funcion

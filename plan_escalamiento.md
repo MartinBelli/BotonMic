@@ -1,7 +1,7 @@
 # Plan de Escalamiento — MicDictado
 
-> Última actualización: 2026-04-30 (tarde)
-> Estado: Fases 0 y 1 cerradas. Próximo paso: decidir foco de Fase 2 (atajos Slack vs post-procesado de dictados).
+> Última actualización: 2026-04-30 (noche)
+> Estado: Fases 0, 1 y 2-piloto cerradas. El "modo limpio con LLM" se descartó como pipeline general — `initial_prompt` expandido + Whisper alcanza. LLM queda como infraestructura para features específicas futuras.
 
 ## Estado actual
 
@@ -171,6 +171,44 @@ Si llegado el momento se necesita upgrade, en orden de costo-beneficio:
 - **Tier medio** como target de hardware del producto.
 - **No comprar PC nueva** hasta tener números del benchmark.
 
+### Fase 2-piloto — "modo limpio" con LLM ❌ DESCARTADA
+
+**Hipótesis**: pasar el texto crudo de Whisper por Llama 3.2 3B con un glosario para corregir términos técnicos sin reescribir el resto. Hotkey nuevo `Insert` para invocarlo.
+
+**Resultado experimental (2026-04-30, en uso real)**:
+
+- Latencia: 12.5 seg de LLM sobre una frase corta de 7 segundos de dictado → **inaceptable** para uso interactivo (16+ seg de espera total tras soltar el hotkey).
+- Calidad: el LLM **agregaba alucinaciones** en lugar de corregir (ej: insertó "Group" donde no estaba, cambió `4.2` → `4,2` rompiendo versiones de software).
+- Insight clave: con el `initial_prompt` expandido (incluyendo Belli, Llama, tool calling, int8, RTX 2060, etc), **Whisper transcribe correctamente sin necesidad de post-procesado**. El LLM no tiene casi nada que corregir, y lo que "corrige" tiende a ser peor que el crudo.
+
+**Conclusión**: el caso de uso "limpieza con glosario" no se justifica con el stack actual. El `initial_prompt` ya cumple esa función a costo cero de latencia.
+
+**Acciones tomadas**:
+- Hotkey `Insert` **revertido** (ya no se registra).
+- LLM **no se carga al arranque** (ahorra ~3 GB de RAM). La función `_load_llm` y `_correct_with_glossary` quedan en el código como **infraestructura** para features futuras que sí justifiquen el costo.
+- `DEFAULT_INITIAL_PROMPT` **expandido** con vocabulario técnico relevante (Belli, Llama, tool calling, int8, RTX 2060, etc). Esto sí fue mejora real y permanece.
+
+**Aprendizaje para el roadmap**: el LLM tiene sentido para casos donde **el output crudo NO es lo que querés escribir** — atajos a APIs, reescritura de registro, formato específico, traducciones. NO para "mejorar un dictado bien transcripto".
+
+### Fase 2 — features con LLM (próxima)
+
+El LLM se invocará **lazy** (carga en primer uso, no al arranque) en features con propósito claro:
+
+- [ ] **Atajos a APIs** (Slack, Gmail, Calendar): voz → tool calling → llamada API directa. El LLM aporta intent classification + extracción de parámetros.
+- [ ] **Reescritura de registro** (informal → email formal, Slack profesional, ticket Jira): voz cruda → LLM con prompt de estilo → texto reformulado.
+- [ ] **Resumen / extracción**: dictás un párrafo largo → LLM resume o extrae bullets.
+- [ ] **Traducción rápida**: voz en español → texto en inglés/portugués/etc.
+
+Cada feature con su propia UX y trigger (no compartir un único hotkey "modo IA").
+
 ## Pendientes inmediatos
 
-**Decisión pendiente**: foco de Fase 2 — atajos Slack (frente 1) vs post-procesado de dictado con LLM (frente 2).
+**Decisión pendiente**: cuál de las features Fase 2 atacar primero.
+
+Mi recomendación arquitectónica: empezar por **atajos a APIs** (Frente A original), porque:
+1. Es la diferenciación más fuerte vs Wispr Flow / SuperWhisper.
+2. El benchmark ya validó que el modelo 3B sirve para tool calling.
+3. La UX del comando de voz se siente natural (un hotkey distinto para "modo comando").
+4. Una vez armado el patrón "voz → LLM → API", agregar nuevos comandos es replicar el patrón.
+
+Pero esto se decide en la próxima sesión.

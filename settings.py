@@ -15,9 +15,12 @@ import threading
 DEFAULT_INITIAL_PROMPT = (
     "Transcripción en español argentino. Vocabulario técnico habitual: "
     "Next.js, React, TypeScript, Tailwind, Vercel, Supabase, Cloudflare, "
-    "Cursor, Claude, Anthropic, Santex, GitHub, pull request, merge, deploy, "
-    "endpoint, middleware, hook, prompt, repo, branch, commit, "
-    "PyInstaller, Whisper, faster-whisper, MicDictado."
+    "Cursor, Claude, Anthropic, Santex, Martin Belli, GitHub, pull request, "
+    "merge, deploy, endpoint, middleware, hook, prompt, repo, branch, commit, "
+    "PyInstaller, Whisper, faster-whisper, MicDictado, "
+    "Llama, Llama 3.2, tool calling, GGUF, int8, int4, Q4, Q4_K_M, "
+    "OpenAI, GPT, RTX 2060, RTX 4070, CUDA, GPU, CPU, RAM, VRAM, "
+    "Ollama, llama.cpp, Hugging Face, embedding, fine-tuning, LLM."
 )
 
 
