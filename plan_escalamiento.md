@@ -1,7 +1,7 @@
 # Plan de Escalamiento — MicDictado
 
-> Última actualización: 2026-04-30
-> Estado: Fase 0 cerrada. Default `small` confirmado. Próximo paso: Fase 1 (LLM local).
+> Última actualización: 2026-04-30 (tarde)
+> Estado: Fases 0 y 1 cerradas. Próximo paso: decidir foco de Fase 2 (atajos Slack vs post-procesado de dictados).
 
 ## Estado actual
 
@@ -88,17 +88,37 @@ Para uso personal: comprar Plaud (~USD 179). Armarlo desde cero son 3–6 meses 
 
 **Bug de proceso detectado**: la primera corrida del benchmark capturó silencio porque el mic estaba muteado y el dispositivo default era la Focusrite (sin señal) en vez del EMEET. Dejado en el script: alerta automática si peak < 0.01 y guardado del WAV en `bench_audio.wav` para poder escuchar manualmente.
 
-### Fase 1 — LLM local **(siguiente)**
+### Fase 1 — LLM local ✅ CERRADA
 
-- [ ] Instalar `llama-cpp-python`.
-- [ ] Descargar Llama 3.2 3B Instruct Q4_K_M (~2 GB) en formato GGUF.
-- [ ] Benchmark: tokens/seg, RAM con Whisper + LLM cargados simultáneo, latencia de respuesta corta.
-- [ ] Validar que la PC banca ambos modelos en paralelo sin swap.
-- [ ] PoC de post-procesado: texto crudo de Whisper → LLM lo limpia usando vocabulario del proyecto (Martin Belli, MicDictado, Llama, tool calling, etc.) → texto final.
+- [x] Instalar `llama-cpp-python` (CPU, buildeada desde source para Python 3.14).
+- [x] Descargar Llama 3.2 3B Instruct Q4_K_M (~1.9 GB GGUF) a `%LOCALAPPDATA%\MicDictado\llm\`.
+- [x] Benchmark: tokens/seg, RAM, latencia, calidad en 3 prompts representativos.
+- [x] Validar que la PC banca ambos modelos en paralelo.
+- [x] PoC inicial de post-procesado y tool calling.
 
-**Criterio**: respuesta < 3 seg para prompts cortos en CPU. RAM total con Whisper small + LLM cargados < 12 GB.
+**Resultados (2026-04-30, CPU only, prompts de ~50–100 tokens)**:
 
-**Nota de diseño**: el LLM debe poder recibir un "diccionario" de términos propios (similar al `initial_prompt` actual de Whisper) para guiar correcciones. Si esto funciona bien, el upgrade de calidad va a ser mucho mayor que el de pasar a medium.
+| | Carga | Tokens/seg | Latencia típica |
+|---|---|---|---|
+| Whisper small | 2.6 s | — | — |
+| Llama 3.2 3B Q4 | 3.4 s | ~6.7 promedio | 6–13 s por prompt |
+
+- **RAM con ambos cargados: 3.4 GB** (límite era 12 GB → holgadísimo).
+- **Tokens/seg: 6.7** → debajo del criterio de >10. Para prompts cortos (tool calling) son ~6 seg de espera, perceptible pero usable. Para prompts largos (reescritura/glosario) son 13+ seg, ya molesto.
+
+**Calidad por caso de uso**:
+
+1. **Tool calling (atajos por voz)**: ✅ JSON válido, intent y parámetros correctos. Único detalle: lo envuelve en \`\`\`json...\`\`\`, hay que pelarlo en el parser.
+2. **Reescritura (Wispr Flow offline)**: ⚠️ regular. Interpretó "che" como nombre y escribió "Estimado Che Pedro". El 3B no maneja muletillas argentinas sin few-shot examples.
+3. **Corrección con glosario**: ⚠️ marginal. Acertó `Martin Belli` y `Llama 3.2`, pero no corrigió `MicDictado` ni `tool calling`, e inventó frases nuevas ("compatible con una RTX 2060"). Riesgo de empeorar transcripciones buenas.
+
+**Sobre GPU**: la wheel CUDA de `llama-cpp-python` no está disponible para Python 3.14 (muy nuevo). Probamos `cu124` y cayó al fallback CPU. Para activar GPU haría falta venv con Python 3.12 (~15 min de setup) o Ollama. **Decisión: posponer hasta empaquetado del producto**. CPU alcanza para validar.
+
+**Conclusión**:
+- El stack Whisper + LLM 3B local **es viable** en la PC actual.
+- Tool calling es el caso de uso más limpio (modelo 3B alcanza).
+- Reescritura y glosario necesitan más iteración (mejor prompting, few-shot, capaz modelo 7B).
+- Próxima decisión: ¿Fase 2 va por atajos (Slack) o por post-procesado de dictado?
 
 ### Fase 2 — PoC primer atajo (Slack)
 
@@ -153,7 +173,4 @@ Si llegado el momento se necesita upgrade, en orden de costo-beneficio:
 
 ## Pendientes inmediatos
 
-1. **Fase 1 — instalar `llama-cpp-python` y bajar Llama 3.2 3B Q4_K_M (GGUF)**.
-2. Armar `bench_llm.py` análogo al de Whisper: tokens/seg, RAM con Whisper + LLM cargados, latencia de prompts cortos.
-3. PoC post-procesado: texto crudo + glosario → texto corregido. Comparar contra el output crudo de Whisper.
-4. Si funciona, decidir formato del glosario (¿reusar `initial_prompt` o lista separada?).
+**Decisión pendiente**: foco de Fase 2 — atajos Slack (frente 1) vs post-procesado de dictado con LLM (frente 2).
