@@ -5,3 +5,7 @@ dist/
 *.egg-info/
 .env
 .claude/
+
+# Outputs locales del benchmark (regenerables, datos personales en el WAV)
+bench_audio.wav
+bench_results.txt

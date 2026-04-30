@@ -1,7 +1,7 @@
 # Plan de Escalamiento — MicDictado
 
-> Última actualización: 2026-04-29
-> Estado: definiendo dirección de producto, pendiente correr benchmark.
+> Última actualización: 2026-04-30
+> Estado: Fase 0 cerrada. Default `small` confirmado. Próximo paso: Fase 1 (LLM local).
 
 ## Estado actual
 
@@ -57,22 +57,48 @@ Para uso personal: comprar Plaud (~USD 179). Armarlo desde cero son 3–6 meses 
 
 ## Roadmap operativo
 
-### Fase 0 — Benchmark de hardware (en curso)
+### Fase 0 — Benchmark de hardware ✅ CERRADA
 
 - [x] Script `bench_whisper.py` armado (compara `small` vs `medium`: latencia, RAM, calidad).
-- [ ] Correr benchmark en la máquina actual (Ryzen 5 4600G, 20 GB, RTX 2060).
-- [ ] Decidir si cambiar default de `small` a `medium`.
+- [x] Correr benchmark en la máquina actual (Ryzen 5 4600G, 20 GB, RTX 2060).
+- [x] Decidir si cambiar default de `small` a `medium` → **NO, queda en `small`**.
 
-**Criterio**: si `medium` corre > 1.0x realtime y suma < 1.5 GB extra de RAM, vale el cambio.
+**Resultados (2026-04-30, audio de 20 seg en CPU, int8, sin VAD ni initial_prompt)**:
 
-### Fase 1 — LLM local
+| | Carga | Trans | xRT | RAM |
+|---|---|---|---|---|
+| `small` | 2.3 s | 4.21 s | 4.8x | 282 MB |
+| `medium` | 4.2 s | 11.90 s | 1.7x | 766 MB |
+
+**Performance**: ambos modelos corren holgado en la PC actual (xRT > 1.0). Medium tarda ~3x más que small (en dictados típicos de 5–10 seg, son +2 a +3 seg de espera tras soltar el hotkey).
+
+**Calidad**: medium acertó algunas frases con números mejor (ej. `INT8` junto, `"4.2 a 1.8 segundos en una RTX 2060"` sin romper la estructura). Pero ambos fallaron por igual en lo más importante:
+
+- `Martin Belli` → small "Bechie", medium "Beggy"
+- `Llama 3.2` → ambos `"la AMA 3.2"`
+- `tool calling` → ambos `"Tooling Calling"`
+- `MicDictado` → small "mi dictada", medium "Mik Dictavas"
+- Medium incluso pifió `Santex` (puso "Antex"), small lo acertó.
+
+**Por qué quedarse en `small`**:
+1. La diferencia de calidad no justifica +3x latencia en uso interactivo.
+2. Los errores grandes (nombres propios, anglicismos) **no se arreglan cambiando el modelo** — Whisper es Whisper.
+3. Lo que sí los arregla es el `initial_prompt` (ya implementado) que sesga al modelo hacia el vocabulario propio. El benchmark corrió crudo, sin prompt — la app real debería transcribir notoriamente mejor.
+4. El verdadero salto de calidad está en post-procesar el texto crudo con un LLM local (Fase 1), no en cambiar el tamaño del modelo de Whisper.
+
+**Bug de proceso detectado**: la primera corrida del benchmark capturó silencio porque el mic estaba muteado y el dispositivo default era la Focusrite (sin señal) en vez del EMEET. Dejado en el script: alerta automática si peak < 0.01 y guardado del WAV en `bench_audio.wav` para poder escuchar manualmente.
+
+### Fase 1 — LLM local **(siguiente)**
 
 - [ ] Instalar `llama-cpp-python`.
 - [ ] Descargar Llama 3.2 3B Instruct Q4_K_M (~2 GB) en formato GGUF.
 - [ ] Benchmark: tokens/seg, RAM con Whisper + LLM cargados simultáneo, latencia de respuesta corta.
 - [ ] Validar que la PC banca ambos modelos en paralelo sin swap.
+- [ ] PoC de post-procesado: texto crudo de Whisper → LLM lo limpia usando vocabulario del proyecto (Martin Belli, MicDictado, Llama, tool calling, etc.) → texto final.
 
-**Criterio**: respuesta < 3 seg para prompts cortos en CPU.
+**Criterio**: respuesta < 3 seg para prompts cortos en CPU. RAM total con Whisper small + LLM cargados < 12 GB.
+
+**Nota de diseño**: el LLM debe poder recibir un "diccionario" de términos propios (similar al `initial_prompt` actual de Whisper) para guiar correcciones. Si esto funciona bien, el upgrade de calidad va a ser mucho mayor que el de pasar a medium.
 
 ### Fase 2 — PoC primer atajo (Slack)
 
@@ -127,5 +153,7 @@ Si llegado el momento se necesita upgrade, en orden de costo-beneficio:
 
 ## Pendientes inmediatos
 
-1. Correr `bench_whisper.py`, documentar resultado al final de este archivo.
-2. Decidir Fase 1 según resultado.
+1. **Fase 1 — instalar `llama-cpp-python` y bajar Llama 3.2 3B Q4_K_M (GGUF)**.
+2. Armar `bench_llm.py` análogo al de Whisper: tokens/seg, RAM con Whisper + LLM cargados, latencia de prompts cortos.
+3. PoC post-procesado: texto crudo + glosario → texto corregido. Comparar contra el output crudo de Whisper.
+4. Si funciona, decidir formato del glosario (¿reusar `initial_prompt` o lista separada?).
