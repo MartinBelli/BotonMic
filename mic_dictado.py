@@ -27,6 +27,13 @@ import numpy as np
 import sounddevice as sd
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from comtypes import CLSCTX_ALL
+
+# Registrar DLLs CUDA del package nvidia-* ANTES de importar faster_whisper.
+# Sin esto, en Windows sin CUDA Toolkit del sistema, ctranslate2 carga el modelo
+# pero falla al hacer el primer encode con "cublas64_12.dll not found".
+from cuda_dlls import setup_cuda_dlls
+setup_cuda_dlls()
+
 from faster_whisper import WhisperModel
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
@@ -594,6 +601,8 @@ class MicDictado:
         # La primera vez descarga ~470 MB a MODEL_DIR. Luego queda cacheado.
         self.model = None
         self._loaded_model_name = None
+        self._loaded_device = None
+        self._loaded_compute_type = None
         self._model_ready = False
         self.overlay.set_state("cargando")
         threading.Thread(target=self._load_model, daemon=True).start()
@@ -610,19 +619,70 @@ class MicDictado:
         self._hotkey_thread = threading.Thread(target=self._listen_hotkey, daemon=True)
         self._hotkey_thread.start()
 
+    def _resolve_device_compute(self):
+        """Resuelve device y compute_type efectivos a usar.
+
+        - 'auto' device -> 'cuda' si hay GPU detectada por ctranslate2, sino 'cpu'.
+        - 'cuda' explicito sin GPU disponible -> warning y se respeta tal cual
+          (la carga real va a fallar y caer al fallback de _load_model).
+        - 'auto' compute_type -> 'float16' en CUDA, 'int8' en CPU (defaults sanos)."""
+        requested_device = settings.device
+        requested_ct = settings.compute_type
+        cuda_available = False
+        try:
+            import ctranslate2
+            cuda_available = ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            cuda_available = False
+
+        if requested_device == "auto":
+            device = "cuda" if cuda_available else "cpu"
+        else:
+            device = requested_device
+
+        if requested_ct == "auto":
+            compute_type = "float16" if device == "cuda" else "int8"
+        else:
+            compute_type = requested_ct
+
+        return device, compute_type
+
     def _load_model(self):
         try:
             os.makedirs(MODEL_DIR, exist_ok=True)
             model_name = settings.model_name
-            print(f"[MicDictado] cargando modelo '{model_name}' en {MODEL_DIR}...")
+            device, compute_type = self._resolve_device_compute()
+            print(f"[MicDictado] cargando modelo '{model_name}' device={device} compute_type={compute_type} ({MODEL_DIR})...")
             t0 = time.time()
-            self.model = WhisperModel(
-                model_name, device="cpu", compute_type="int8",
-                download_root=MODEL_DIR,
-            )
+            try:
+                self.model = WhisperModel(
+                    model_name, device=device, compute_type=compute_type,
+                    download_root=MODEL_DIR,
+                )
+                self._loaded_device = device
+                self._loaded_compute_type = compute_type
+            except Exception as gpu_err:
+                # Fallback transparente: si pidieron CUDA y fallo (driver, VRAM,
+                # compute_type no soportado), seguimos con CPU+int8 que es el
+                # combo que ya sabemos que anda. Asi el dictado no queda muerto
+                # por un cambio de Settings o por que arranco Ollama y nos
+                # quedamos sin VRAM.
+                if device == "cuda":
+                    print(f"[MicDictado] WARNING: fallo cargando en CUDA ({gpu_err}); fallback a CPU+int8")
+                    self.model = WhisperModel(
+                        model_name, device="cpu", compute_type="int8",
+                        download_root=MODEL_DIR,
+                    )
+                    self._loaded_device = "cpu"
+                    self._loaded_compute_type = "int8"
+                else:
+                    raise
             self._loaded_model_name = model_name
             self._model_ready = True
-            print(f"[MicDictado] modelo listo en {time.time() - t0:.1f}s")
+            print(
+                f"[MicDictado] modelo listo en {time.time() - t0:.1f}s "
+                f"(device={self._loaded_device}, compute_type={self._loaded_compute_type})"
+            )
             self.overlay.root.after(0, self.overlay.set_state, "idle")
         except Exception as e:
             print(f"[MicDictado] error cargando modelo: {e}")
@@ -791,8 +851,18 @@ class MicDictado:
             print(f"[MicDictado] error escribiendo historial: {e}")
 
     def reload_model_if_needed(self):
-        """Si el settings.model_name cambio, recarga el modelo en background."""
-        if getattr(self, "_loaded_model_name", None) == settings.model_name:
+        """Si model_name/device/compute_type cambiaron, recarga el modelo en background.
+
+        Compara contra los valores efectivos cargados (post-resolucion 'auto'),
+        no contra el string crudo de settings: asi un cambio cosmetico de
+        'auto' -> 'cuda' (cuando ya estabamos en cuda por auto) no dispara
+        reload innecesario."""
+        target_device, target_ct = self._resolve_device_compute()
+        if (
+            getattr(self, "_loaded_model_name", None) == settings.model_name
+            and getattr(self, "_loaded_device", None) == target_device
+            and getattr(self, "_loaded_compute_type", None) == target_ct
+        ):
             return
         self._model_ready = False
         self.overlay.root.after(0, self.overlay.set_state, "cargando")

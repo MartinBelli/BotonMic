@@ -166,34 +166,55 @@ class SettingsWindow(tk.Toplevel):
                 f_trans, text=lbl, variable=self.var_model, value=val,
             ).grid(row=1 + i, column=0, columnspan=2, sticky="w", padx=20, pady=1)
 
+        # Device + compute_type. 'auto' detecta GPU y elige float16; sino cae a
+        # CPU+int8. El usuario puede forzar cualquier combinacion. Si CUDA falla
+        # al cargar (driver, VRAM, etc.), _load_model hace fallback a CPU.
+        ttk.Label(f_trans, text="Dispositivo:").grid(
+            row=5, column=0, sticky="w", padx=8, pady=(8, 2)
+        )
+        self.var_device = tk.StringVar(value=settings.device)
+        ttk.Combobox(
+            f_trans, textvariable=self.var_device, state="readonly",
+            values=["auto", "cpu", "cuda"], width=10,
+        ).grid(row=5, column=1, sticky="w", pady=(8, 2))
+
+        ttk.Label(f_trans, text="Compute type:").grid(
+            row=6, column=0, sticky="w", padx=8, pady=2
+        )
+        self.var_ct = tk.StringVar(value=settings.compute_type)
+        ttk.Combobox(
+            f_trans, textvariable=self.var_ct, state="readonly",
+            values=["auto", "int8", "int8_float16", "float16", "float32"], width=14,
+        ).grid(row=6, column=1, sticky="w", pady=2)
+
         self.var_vad = tk.BooleanVar(value=bool(settings.vad_filter))
         ttk.Checkbutton(
             f_trans, text="VAD filter (recorta silencios, recomendado)",
             variable=self.var_vad, command=self._on_vad_change,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
 
         ttk.Label(f_trans, text="Beam size (1 = más rápido, 5 = más preciso):").grid(
-            row=6, column=0, sticky="w", padx=8, pady=4
+            row=8, column=0, sticky="w", padx=8, pady=4
         )
         self.var_beam = tk.IntVar(value=int(settings.beam_size))
         ttk.Spinbox(
             f_trans, from_=1, to=5, width=4, textvariable=self.var_beam,
             command=self._on_beam_change,
-        ).grid(row=6, column=1, sticky="w", pady=4)
+        ).grid(row=8, column=1, sticky="w", pady=4)
 
         ttk.Label(
             f_trans,
             text="Vocabulario / contexto (initial_prompt):",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 2))
         ttk.Label(
             f_trans,
             text="Sesga al modelo hacia palabras escritas así. Ideal para nombres, marcas, jerga.",
             foreground="#666666",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
 
         # Frame contenedor para Text + Scrollbar (tk.Text no es ttk)
         f_prompt = ttk.Frame(f_trans)
-        f_prompt.grid(row=9, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
+        f_prompt.grid(row=11, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
         f_prompt.columnconfigure(0, weight=1)
 
         self.txt_prompt = tk.Text(
@@ -209,7 +230,7 @@ class SettingsWindow(tk.Toplevel):
         ttk.Button(
             f_trans, text="Restaurar default",
             command=self._on_restore_prompt,
-        ).grid(row=10, column=0, sticky="w", padx=8, pady=(2, 6))
+        ).grid(row=12, column=0, sticky="w", padx=8, pady=(2, 6))
 
         f_trans.columnconfigure(1, weight=1)
 
@@ -342,6 +363,8 @@ class SettingsWindow(tk.Toplevel):
         settings.update(
             ducking_exclude=excl or list(DEFAULTS["ducking_exclude"]),
             model_name=self.var_model.get(),
+            device=self.var_device.get(),
+            compute_type=self.var_ct.get(),
             initial_prompt=prompt_text,
             history_max_entries=hist_max,
         )

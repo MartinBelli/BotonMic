@@ -41,6 +41,11 @@ DEFAULTS = {
 
     # Transcripcion
     "model_name": "small",           # tiny | base | small | medium
+    # device/compute_type: 'auto' detecta GPU y elige float16 si hay CUDA, sino
+    # cae a CPU+int8. El usuario puede forzar cualquier combinacion. Si CUDA
+    # falla al cargar, _load_model hace fallback transparente a CPU+int8.
+    "device": "auto",                # auto | cpu | cuda
+    "compute_type": "auto",          # auto | int8 | int8_float16 | float16 | float32
     "beam_size": 1,                  # 1 = greedy, mas alto = mas preciso/lento
     "vad_filter": True,
     # initial_prompt: contexto/vocabulario que se le pasa a Whisper como "final

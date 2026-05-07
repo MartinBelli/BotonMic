@@ -1,12 +1,17 @@
 """
-Benchmark Whisper small vs medium en CPU.
+Benchmark Whisper en distintos device / compute_type / modelos.
 
-Graba unos segundos desde el microfono y transcribe con ambos modelos midiendo:
-  - Tiempo de carga del modelo (primera vez baja ~770 MB para medium)
-  - Tiempo de transcripcion
+Graba unos segundos desde el microfono y transcribe con cada combinacion
+del set de configuraciones definido (CONFIGS) midiendo:
+  - Tiempo de carga del modelo (primera vez baja ~470 MB para small)
+  - Tiempo de transcripcion (warm: con kernels ya calentados)
   - Factor x realtime (cuanto mas rapido que tiempo real corre)
-  - RAM consumida por el modelo
+  - RAM proceso + (si CUDA) VRAM al cargar
   - Texto resultante (para comparar calidad a ojo)
+
+Hace 2 corridas de transcripcion por config: la primera incluye el costo de
+"calentar" los kernels CUDA / cache CTranslate2, que distorsiona la lectura.
+Reportamos la SEGUNDA (warm) como representativa del uso real ya en marcha.
 
 Al final guarda el resumen + los textos transcriptos en
 bench_results.txt en el cwd, para que no se pierdan si el output
@@ -23,6 +28,11 @@ import time
 
 import numpy as np
 import sounddevice as sd
+
+# Registrar DLLs CUDA antes de importar faster_whisper (idem mic_dictado.py).
+from cuda_dlls import setup_cuda_dlls
+setup_cuda_dlls()
+
 from faster_whisper import WhisperModel
 
 try:
@@ -30,6 +40,14 @@ try:
     HAY_PSUTIL = True
 except ImportError:
     HAY_PSUTIL = False
+
+try:
+    import ctranslate2
+    HAY_CT2 = True
+    CUDA_DEVICES = ctranslate2.get_cuda_device_count()
+except Exception:
+    HAY_CT2 = False
+    CUDA_DEVICES = 0
 
 SAMPLE_RATE = 16000
 DURACION_S = 20
@@ -39,6 +57,14 @@ MODEL_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
     "MicDictado", "models",
 )
+
+# Configuraciones a probar. Si CUDA no esta disponible, las CUDA se saltean
+# automaticamente con un mensaje. Para Fase 1 nos enfocamos en small + small CUDA.
+# La Fase 2 va a agregar large-v3-turbo a esta lista.
+CONFIGS = [
+    {"name": "small / cpu int8",        "model": "small",  "device": "cpu",  "compute_type": "int8"},
+    {"name": "small / cuda float16",    "model": "small",  "device": "cuda", "compute_type": "float16"},
+]
 
 # Texto de prueba pensado para mostrar diferencias entre small y medium:
 #  - Nombres propios (Martin Belli, MicDictado, Santex, OpenAI, Whisper, Llama)
@@ -139,55 +165,82 @@ def grabar_audio():
     return audio
 
 
-def benchmark(nombre, audio):
+def benchmark(cfg, audio):
+    nombre = cfg["name"]
     print("=" * 64)
-    print(f"MODELO: {nombre}")
+    print(f"CONFIG: {nombre}")
     print("=" * 64)
+
+    if cfg["device"] == "cuda" and CUDA_DEVICES == 0:
+        print("  CUDA pedido pero no hay GPU detectada por ctranslate2; salteando.\n")
+        return None
 
     gc.collect()
     ram_antes = ram_proceso_mb()
 
     t0 = time.time()
-    modelo = WhisperModel(
-        nombre, device="cpu", compute_type="int8", download_root=MODEL_DIR
-    )
+    try:
+        modelo = WhisperModel(
+            cfg["model"],
+            device=cfg["device"],
+            compute_type=cfg["compute_type"],
+            download_root=MODEL_DIR,
+        )
+    except Exception as e:
+        print(f"  ERROR al cargar: {e}\n")
+        return None
     t_carga = time.time() - t0
 
     ram_cargado = ram_proceso_mb()
     delta_ram = ram_cargado - ram_antes
 
-    print(f"  Tiempo de carga:   {t_carga:>7.1f} s")
+    print(f"  Tiempo de carga:    {t_carga:>7.1f} s")
     if HAY_PSUTIL:
-        print(f"  RAM del modelo:    {delta_ram:>7.0f} MB")
+        print(f"  RAM del modelo:     {delta_ram:>7.0f} MB")
 
+    # Primera corrida (cold): incluye compilacion de kernels CUDA / cache CT2.
+    # Reportamos pero no usamos para comparar; sirve para ver el "primer hit".
     t0 = time.time()
-    segments, info = modelo.transcribe(audio, language="es", beam_size=1)
-    texto = " ".join(s.text for s in segments).strip()
-    t_trans = time.time() - t0
-    factor_rt = DURACION_S / t_trans if t_trans > 0 else 0.0
+    segments, _ = modelo.transcribe(audio, language="es", beam_size=1)
+    texto_cold = " ".join(s.text for s in segments).strip()
+    t_cold = time.time() - t0
+    rt_cold = DURACION_S / t_cold if t_cold > 0 else 0.0
+    print(f"  Transcripcion cold: {t_cold:>7.2f} s  ({rt_cold:.1f}x realtime)")
 
-    print(f"  Transcripcion:     {t_trans:>7.2f} s  ({factor_rt:.1f}x realtime)")
-    print(f"\n  Texto resultante:")
-    print(f"  >>> {texto}\n")
+    # Segunda corrida (warm): representativa del uso real ya en marcha.
+    t0 = time.time()
+    segments, _ = modelo.transcribe(audio, language="es", beam_size=1)
+    texto_warm = " ".join(s.text for s in segments).strip()
+    t_warm = time.time() - t0
+    rt_warm = DURACION_S / t_warm if t_warm > 0 else 0.0
+    print(f"  Transcripcion warm: {t_warm:>7.2f} s  ({rt_warm:.1f}x realtime)")
+
+    print(f"\n  Texto resultante (warm):")
+    print(f"  >>> {texto_warm}\n")
 
     del modelo
     gc.collect()
 
     return {
-        "modelo": nombre,
+        "name": nombre,
+        "model": cfg["model"],
+        "device": cfg["device"],
+        "compute_type": cfg["compute_type"],
         "t_carga": t_carga,
-        "t_trans": t_trans,
-        "factor_rt": factor_rt,
+        "t_cold": t_cold,
+        "t_warm": t_warm,
+        "rt_warm": rt_warm,
         "ram_mb": delta_ram,
-        "texto": texto,
+        "texto": texto_warm,
     }
 
 
 def main():
     print("=" * 64)
-    print("BENCHMARK Whisper small vs medium (CPU, int8)")
+    print("BENCHMARK Whisper - configuraciones device/compute_type")
     print("=" * 64)
     print(f"Cache de modelos: {MODEL_DIR}")
+    print(f"CUDA disponible: {'si (' + str(CUDA_DEVICES) + ' GPU)' if CUDA_DEVICES else 'no'}")
     if not HAY_PSUTIL:
         print("(psutil no instalado: no se va a medir RAM. Opcional: pip install psutil)")
     print()
@@ -195,35 +248,51 @@ def main():
     audio = grabar_audio()
 
     resultados = []
-    for nombre in ["small", "medium"]:
+    for cfg in CONFIGS:
         try:
-            resultados.append(benchmark(nombre, audio))
+            r = benchmark(cfg, audio)
+            if r is not None:
+                resultados.append(r)
         except Exception as e:
-            print(f"ERROR con {nombre}: {e}\n")
+            print(f"ERROR con {cfg['name']}: {e}\n")
+
+    if not resultados:
+        print("No hubo resultados. Salgo.")
+        return
 
     # ── Resumen formateado: imprimir a consola Y guardar en archivo ──
     lineas = []
     lineas.append("=" * 64)
-    lineas.append("RESUMEN COMPARATIVO")
+    lineas.append("RESUMEN COMPARATIVO (warm = 2da corrida, kernels calientes)")
     lineas.append("=" * 64)
     lineas.append(f"Fecha: {datetime.datetime.now().isoformat(timespec='seconds')}")
     lineas.append(f"Duracion del audio: {DURACION_S} s")
     lineas.append("")
-    header = f"{'Modelo':<10}{'Carga (s)':<12}{'Trans (s)':<12}{'xRT':<8}"
+    header = f"{'Config':<24}{'Carga(s)':<10}{'Cold(s)':<10}{'Warm(s)':<10}{'xRT':<7}"
     if HAY_PSUTIL:
-        header += f"{'RAM (MB)':<10}"
+        header += f"{'RAM(MB)':<9}"
     lineas.append(header)
     lineas.append("-" * len(header))
     for r in resultados:
         row = (
-            f"{r['modelo']:<10}"
-            f"{r['t_carga']:<12.1f}"
-            f"{r['t_trans']:<12.2f}"
-            f"{r['factor_rt']:<8.1f}"
+            f"{r['name']:<24}"
+            f"{r['t_carga']:<10.1f}"
+            f"{r['t_cold']:<10.2f}"
+            f"{r['t_warm']:<10.2f}"
+            f"{r['rt_warm']:<7.1f}"
         )
         if HAY_PSUTIL:
-            row += f"{r['ram_mb']:<10.0f}"
+            row += f"{r['ram_mb']:<9.0f}"
         lineas.append(row)
+
+    # Speedup vs el primer config (CPU baseline)
+    if len(resultados) >= 2:
+        baseline = resultados[0]["t_warm"]
+        lineas.append("")
+        lineas.append("Speedup vs " + resultados[0]["name"] + " (basado en warm):")
+        for r in resultados[1:]:
+            sp = baseline / r["t_warm"] if r["t_warm"] > 0 else 0.0
+            lineas.append(f"  {r['name']:<24} {sp:.2f}x")
 
     lineas.append("")
     lineas.append("=" * 64)
@@ -233,18 +302,18 @@ def main():
     lineas.append("")
     for r in resultados:
         lineas.append("=" * 64)
-        lineas.append(f"TEXTO TRANSCRIPTO POR: {r['modelo']}")
+        lineas.append(f"TEXTO TRANSCRIPTO POR: {r['name']}")
         lineas.append("=" * 64)
         lineas.append(r["texto"] or "(vacio)")
         lineas.append("")
 
     lineas.append("Pistas para leer el resultado:")
-    lineas.append(" - xRT > 1.0  -> el modelo transcribe mas rapido que el audio.")
-    lineas.append(" - Compara cada texto contra el TEXTO DE REFERENCIA.")
-    lineas.append("   Los puntos donde small suele fallar y medium acertar:")
-    lineas.append("     * Nombres propios: Martin Belli, MicDictado, Santex, Llama")
-    lineas.append("     * Versiones / numeros: int8, RTX 2060, 4.2, 1.8, 3.2")
-    lineas.append("     * Anglicismos tecnicos: tool calling, Slack, Gmail")
+    lineas.append(" - xRT > 1.0 -> el modelo transcribe mas rapido que el audio.")
+    lineas.append(" - 'cold' incluye compilacion de kernels CUDA y cache; 'warm' es")
+    lineas.append("   representativo del uso ya en marcha tras el primer disparo.")
+    lineas.append(" - Comparar cada texto contra el TEXTO DE REFERENCIA: nombres")
+    lineas.append("   propios (Martin Belli, MicDictado, Santex, Llama), versiones")
+    lineas.append("   (int8, RTX 2060, 4.2, 1.8, 3.2) y anglicismos (tool calling).")
 
     salida = "\n".join(lineas)
     print(salida)
