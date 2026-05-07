@@ -58,12 +58,17 @@ MODEL_DIR = os.path.join(
     "MicDictado", "models",
 )
 
-# Configuraciones a probar. Si CUDA no esta disponible, las CUDA se saltean
-# automaticamente con un mensaje. Para Fase 1 nos enfocamos en small + small CUDA.
-# La Fase 2 va a agregar large-v3-turbo a esta lista.
+# Configuraciones a probar. Las CUDA se saltean automaticamente con un mensaje
+# si no hay GPU detectada. El primer config (CPU int8) es el baseline historico
+# con el que comparamos speedup; los siguientes son las opciones modernas:
+#   - small en GPU: speedup directo del mismo modelo, sin tocar calidad.
+#   - turbo en GPU: modelo nuevo (~810M params, decoder de solo 4 capas), promete
+#     calidad cercana a large-v3 con velocidad parecida a small. Sweet spot
+#     candidato a default cuando hay GPU.
 CONFIGS = [
-    {"name": "small / cpu int8",        "model": "small",  "device": "cpu",  "compute_type": "int8"},
-    {"name": "small / cuda float16",    "model": "small",  "device": "cuda", "compute_type": "float16"},
+    {"name": "small / cpu int8",        "model": "small",          "device": "cpu",  "compute_type": "int8"},
+    {"name": "small / cuda float16",    "model": "small",          "device": "cuda", "compute_type": "float16"},
+    {"name": "turbo / cuda float16",    "model": "large-v3-turbo", "device": "cuda", "compute_type": "float16"},
 ]
 
 # Texto de prueba pensado para mostrar diferencias entre small y medium:

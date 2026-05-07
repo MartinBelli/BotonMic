@@ -40,7 +40,7 @@ DEFAULTS = {
     ],
 
     # Transcripcion
-    "model_name": "small",           # tiny | base | small | medium
+    "model_name": "small",           # tiny | base | small | medium | large-v3-turbo
     # device/compute_type: 'auto' detecta GPU y elige float16 si hay CUDA, sino
     # cae a CPU+int8. El usuario puede forzar cualquier combinacion. Si CUDA
     # falla al cargar, _load_model hace fallback transparente a CPU+int8.
