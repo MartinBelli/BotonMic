@@ -678,6 +678,30 @@ class MicDictado:
                 else:
                     raise
             self._loaded_model_name = model_name
+
+            # Pre-warmup: corre una transcripcion dummy de 0.5s de silencio
+            # para que CTranslate2 compile / cachee los kernels (sobre todo en
+            # CUDA, donde la primera invocacion paga la compilacion JIT). Sin
+            # esto, la PRIMERA dictada del usuario paga ese costo (~0.3-1s
+            # extra que sorprende). Con warmup, "modelo listo" significa
+            # "listo Y caliente": la primera dictada real se siente igual de
+            # rapida que la 5ta.
+            try:
+                warmup_audio = np.zeros(SAMPLE_RATE // 2, dtype=np.float32)
+                t_warm = time.time()
+                segs, _ = self.model.transcribe(
+                    warmup_audio, language=MODEL_LANG, beam_size=1
+                )
+                # transcribe devuelve un generator; consumirlo dispara el
+                # encode + decode reales que es donde compilan los kernels.
+                list(segs)
+                print(f"[MicDictado] pre-warmup en {time.time() - t_warm:.2f}s")
+            except Exception as warm_err:
+                # Best-effort: si el warmup falla, seguimos. La primera
+                # transcripcion real va a hacer el trabajo igual, solo que
+                # con un toque de penalty perceptible esa unica vez.
+                print(f"[MicDictado] pre-warmup fallo (no critico): {warm_err}")
+
             self._model_ready = True
             print(
                 f"[MicDictado] modelo listo en {time.time() - t0:.1f}s "
