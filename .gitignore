@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+_legacy/
 *.egg-info/
 .env
 .claude/
