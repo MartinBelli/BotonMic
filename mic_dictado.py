@@ -295,6 +295,33 @@ def _lerp_rgb(c1, c2, t):
     )
 
 
+def _has_repetitive_loop(texto):
+    """Detecta loops tipicos de Whisper: misma secuencia de 3+ palabras
+    repetida 3+ veces consecutivas. Patron canonico cuando el modelo
+    alucina sobre silencio/ruido: '¿Me explicas las? ¿Me explicas las?
+    ¿Me explicas las? ¿Me explicas las?'.
+
+    O(n^2) sobre la cantidad de palabras; con n tipico < 100 es
+    trivial. Se compara en lowercase y sin puntuacion para que '¿X?'
+    matchee con 'X.' que matchee con 'x'."""
+    palabras = [w.strip(".,;:¿?¡!\"'()[]") for w in texto.lower().split()]
+    palabras = [w for w in palabras if w]
+    if len(palabras) < 9:  # minimo: 3 palabras x 3 repeticiones
+        return False
+    max_ventana = min(8, len(palabras) // 3)
+    for n in range(3, max_ventana + 1):
+        for start in range(len(palabras) - 3 * n + 1):
+            ventana = palabras[start:start + n]
+            repeticiones = 1
+            pos = start + n
+            while pos + n <= len(palabras) and palabras[pos:pos + n] == ventana:
+                repeticiones += 1
+                pos += n
+            if repeticiones >= 3:
+                return True
+    return False
+
+
 class DictadoOverlay:
     """Overlay flotante con forma de pildora redondeada renderizada con Pillow.
 
@@ -337,6 +364,8 @@ class DictadoOverlay:
     COLOR_TRANS = "#f0a020"
     COLOR_LOAD = "#4080e0"
     COLOR_CLEAN = "#9b59b6"  # violeta: estado limpiando (LLM corrigiendo texto)
+    COLOR_REPROC = "#c0461a"   # naranja oscuro: reprocesando (loop detectado)
+    COLOR_NOMATCH = "#707070"  # gris: audio no entendido (segundo intento tambien loopeo)
 
     LED_GREEN = "#28be5c"
     LED_YELLOW = "#f0c020"
@@ -436,8 +465,10 @@ class DictadoOverlay:
         self._level_source = getter
 
     def set_state(self, estado, preview=None):
-        """Estados: idle, cargando, grabando, transcribiendo, limpiando."""
-        if estado not in ("idle", "cargando", "grabando", "transcribiendo", "limpiando"):
+        """Estados: idle, cargando, grabando, transcribiendo, limpiando,
+        reprocesando, no_entendido."""
+        if estado not in ("idle", "cargando", "grabando", "transcribiendo",
+                          "limpiando", "reprocesando", "no_entendido"):
             estado = "idle"
         self._estado = estado
 
@@ -518,10 +549,12 @@ class DictadoOverlay:
 
         # ── Color y texto del estado ─────────────────────────
         state_color_hex, label_text = {
-            "cargando":      (self.COLOR_LOAD,  "Cargando modelo..."),
-            "grabando":      (self.COLOR_REC,   "Grabando..."),
-            "transcribiendo":(self.COLOR_TRANS, "Transcribiendo..."),
-            "limpiando":     (self.COLOR_CLEAN, "Limpiando..."),
+            "cargando":      (self.COLOR_LOAD,    "Cargando modelo..."),
+            "grabando":      (self.COLOR_REC,     "Grabando..."),
+            "transcribiendo":(self.COLOR_TRANS,   "Transcribiendo..."),
+            "limpiando":     (self.COLOR_CLEAN,   "Limpiando..."),
+            "reprocesando":  (self.COLOR_REPROC,  "Reprocesando..."),
+            "no_entendido":  (self.COLOR_NOMATCH, "Audio no entendido"),
         }.get(self._estado, (self.COLOR_IDLE, ""))
         state_color = _hex_to_rgb(state_color_hex)
 
@@ -1050,9 +1083,37 @@ class MicDictado:
         finally:
             self.grabando = False
 
+    def _transcribir(self, audio_f32, initial_prompt, beam_size, vad_filter,
+                      condition_on_previous_text=True):
+        """Llama a model.transcribe y devuelve (texto_unido, elapsed_s).
+
+        Aislado para usarse tanto en el primer pase (parametros del usuario)
+        como en el reprocesamiento defensivo (parametros mas conservadores)
+        sin duplicar codigo."""
+        t0 = time.time()
+        segments, _ = self.model.transcribe(
+            audio_f32,
+            language=MODEL_LANG,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            initial_prompt=initial_prompt,
+            condition_on_previous_text=condition_on_previous_text,
+        )
+        # segments es un generator; consumirlo materializa la transcripcion
+        texto = " ".join(seg.text.strip() for seg in segments).strip()
+        return texto, time.time() - t0
+
     def _procesar_audio(self):
-        """Transcribe el buffer capturado con faster-whisper y lo imprime."""
+        """Transcribe el buffer y pega. Si el primer intento devuelve un
+        loop repetitivo (patron tipico de Whisper bajo presion de memoria
+        o con audio degradado), reprocesa el mismo audio con beam_size=5
+        y vad_filter=False (mas robusto contra alucinaciones). Si el
+        segundo intento tambien loopea, descarta sin pegar y avisa
+        visualmente con 'Audio no entendido' por 2s."""
         self.overlay.root.after(0, self.overlay.set_state, "transcribiendo")
+        # Si descartamos por loop persistente programamos el idle nosotros
+        # con un after(2000); en ese caso el finally NO debe sobreescribir.
+        overlay_diferido = False
         try:
             with self._buffer_lock:
                 chunks = list(self._audio_buffer)
@@ -1072,19 +1133,42 @@ class MicDictado:
                 return
 
             print(f"[MicDictado] transcribiendo {duracion:.2f}s de audio...")
-            t0 = time.time()
             initial_prompt = (settings.initial_prompt or "").strip() or None
-            segments, info = self.model.transcribe(
-                audio_f32,
-                language=MODEL_LANG,
+
+            # Primer pase con los parametros configurados por el usuario
+            texto, elapsed = self._transcribir(
+                audio_f32, initial_prompt,
                 beam_size=settings.beam_size,
                 vad_filter=settings.vad_filter,
-                initial_prompt=initial_prompt,
             )
-            # segments es un generator; consumirlo materializa la transcripcion
-            texto = " ".join(seg.text.strip() for seg in segments).strip()
-            elapsed = time.time() - t0
             print(f"[MicDictado] transcripcion ({elapsed:.1f}s): {texto!r}")
+
+            # Deteccion de loop + reprocesamiento defensivo.
+            # beam_size=5: beam search corta loops que greedy (beam=1) deja pasar.
+            # vad_filter=False: el VAD a veces le pasa al modelo chunks raros que
+            #   son los que originan el loop; mejor mandarle el audio entero.
+            # condition_on_previous_text=False: previene que el primer segmento
+            #   defectuoso contagie a los siguientes via condicionamiento autoregresivo.
+            if texto and _has_repetitive_loop(texto):
+                print("[MicDictado] loop repetitivo detectado, reprocesando con beam=5...")
+                self.overlay.root.after(0, self.overlay.set_state, "reprocesando")
+                texto, elapsed2 = self._transcribir(
+                    audio_f32, initial_prompt,
+                    beam_size=5, vad_filter=False,
+                    condition_on_previous_text=False,
+                )
+                elapsed += elapsed2
+                print(f"[MicDictado] reprocesamiento ({elapsed2:.1f}s): {texto!r}")
+
+                if _has_repetitive_loop(texto):
+                    # El loop persiste -> el audio realmente esta degradado
+                    # (RAM swappeada, ruido fuerte, etc.). Descartamos y
+                    # avisamos para que el usuario hable de nuevo.
+                    print("[MicDictado] loop persiste tras reprocesar, descartando")
+                    self.overlay.root.after(0, self.overlay.set_state, "no_entendido")
+                    self.overlay.root.after(2000, lambda: self.overlay.set_state("idle"))
+                    overlay_diferido = True
+                    return
 
             # Persistir en historial (solo si esta habilitado y hay texto util)
             if texto and settings.history_enabled:
@@ -1117,7 +1201,8 @@ class MicDictado:
             except Exception:
                 pass
         finally:
-            self.overlay.root.after(0, self.overlay.set_state, "idle")
+            if not overlay_diferido:
+                self.overlay.root.after(0, self.overlay.set_state, "idle")
 
     def run(self):
         self.overlay.root.mainloop()
