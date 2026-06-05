@@ -15,6 +15,7 @@ import datetime
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -226,15 +227,24 @@ def _release_modifiers():
     letras Unicode se interpretan como atajos (Ctrl+B, Ctrl+S...) en la app
     destino y "se comen" parte del texto. SendInput de KEYUP solo afecta el
     estado logico que ve la app destino; las teclas fisicas siguen pulsadas
-    hasta que el usuario las suelte de verdad."""
+    hasta que el usuario las suelte de verdad.
+
+    Solo soltamos los modificadores que estan realmente presionados: un
+    key-up de Alt "suelto" (sin Alt presionado) activa el modo menu/KeyTips
+    en apps como el Notepad de Win11, que despues se traga los caracteres."""
+    u32 = ctypes.windll.user32
     inputs = []
     for vk in _VK_MODIFIERS:
+        if not (u32.GetAsyncKeyState(vk) & 0x8000):
+            continue
         inp = _INPUT()
         inp.type = _INPUT_KEYBOARD
         inp.union.ki = _KEYBDINPUT(vk, 0, _KEYEVENTF_KEYUP, 0, None)
         inputs.append(inp)
+    if not inputs:
+        return
     arr = (_INPUT * len(inputs))(*inputs)
-    ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT))
+    u32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT))
 
 
 def type_text_unicode(texto, batch_size=20, batch_delay=0.005):
@@ -275,7 +285,17 @@ def type_text_unicode(texto, batch_size=20, batch_delay=0.005):
     for i in range(0, len(inputs), step):
         batch = inputs[i:i + step]
         arr = (_INPUT * len(batch))(*batch)
-        user32.SendInput(len(batch), arr, sizeof_input)
+        sent = user32.SendInput(len(batch), arr, sizeof_input)
+        if sent != len(batch):
+            # SendInput puede ser bloqueado por UIPI (app destino corriendo
+            # elevada/como admin) o por el sistema. Lo logueamos en vez de
+            # fallar en silencio para poder diagnosticar.
+            err = ctypes.windll.kernel32.GetLastError()
+            print(
+                f"[MicDictado] SendInput bloqueado: envio {sent}/{len(batch)} "
+                f"eventos (GetLastError={err}). ¿La app destino corre como admin?"
+            )
+            return
         if i + step < len(inputs):
             time.sleep(batch_delay)
 
@@ -293,6 +313,23 @@ def _lerp_rgb(c1, c2, t):
         int(c1[1] + (c2[1] - c1[1]) * t),
         int(c1[2] + (c2[2] - c1[2]) * t),
     )
+
+
+def _limpiar_alucinaciones(texto):
+    """Elimina rachas de puntos/puntos suspensivos que Whisper (sobre todo
+    large-v3-turbo) alucina sobre tramos de silencio: 'Hola,...………….Hola'.
+
+    Quita secuencias de 2+ caracteres '.' o '…' (con o sin espacios entre
+    medio) y normaliza los espacios resultantes. Un punto simple legitimo
+    de fin de oracion no se toca."""
+    # 2+ puntos/elipsis consecutivos (admite espacios intercalados): fuera
+    texto = re.sub(r"[.…](?:\s*[.…])+", " ", texto)
+    # '…' suelto tambien es alucinacion tipica de silencio en dictado
+    texto = re.sub(r"…", " ", texto)
+    # Limpiar residuos: espacios multiples y espacios antes de puntuacion
+    texto = re.sub(r"\s+([,.;:!?])", r"\1", texto)
+    texto = re.sub(r"\s{2,}", " ", texto)
+    return texto.strip()
 
 
 def _has_repetitive_loop(texto):
@@ -426,7 +463,26 @@ class DictadoOverlay:
         self._level_source = None
         self._loop_running = False
 
+        # Win11: deiconify()/lift() activan la ventana (en Win10 no pasaba con
+        # overrideredirect) -> el overlay robaba el foco y el SendInput tipeaba
+        # el texto en el overlay en vez de la app destino. WS_EX_NOACTIVATE
+        # garantiza que esta ventana nunca pueda tomar foco.
+        self._make_noactivate()
+
         self.set_state("idle")
+
+    def _make_noactivate(self):
+        """Aplica WS_EX_NOACTIVATE al HWND del overlay para que nunca robe el foco."""
+        try:
+            self.root.update_idletasks()
+            u32 = ctypes.windll.user32
+            hwnd = u32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
+        except Exception as e:
+            print(f"[MicDictado] no se pudo aplicar WS_EX_NOACTIVATE: {e}")
 
     # ── Carga de fuente ──────────────────────────────────────────
 
@@ -1099,8 +1155,23 @@ class MicDictado:
             initial_prompt=initial_prompt,
             condition_on_previous_text=condition_on_previous_text,
         )
-        # segments es un generator; consumirlo materializa la transcripcion
-        texto = " ".join(seg.text.strip() for seg in segments).strip()
+        # segments es un generator; consumirlo materializa la transcripcion.
+        # Filtramos segmentos que el propio modelo marca como probable
+        # silencio (no_speech_prob alto): son la fuente de las alucinaciones
+        # tipo '…………' que turbo genera sobre pausas entre frases.
+        partes = []
+        for seg in segments:
+            txt = seg.text.strip()
+            if not txt:
+                continue
+            if seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8:
+                print(
+                    f"[MicDictado] segmento descartado (no_speech={seg.no_speech_prob:.2f}, "
+                    f"logprob={seg.avg_logprob:.2f}): {txt!r}"
+                )
+                continue
+            partes.append(txt)
+        texto = _limpiar_alucinaciones(" ".join(partes))
         return texto, time.time() - t0
 
     def _procesar_audio(self):
@@ -1189,6 +1260,13 @@ class MicDictado:
             # Guardamos el texto en _last_text por si el usuario quiere re-pegarlo
             # con Ctrl+Shift+Space (caso tipico: perdio el foco antes del pegado).
             self._last_text = texto
+            # Igual que en _repaste_last: el stop llego via Ctrl+Shift+F11 y el
+            # usuario puede seguir teniendo Ctrl/Shift fisicamente pulsados
+            # (la transcripcion tarda <1s). Sin el release, los caracteres
+            # Unicode se interpretan como atajos/chars de control en la app
+            # destino y el texto se pega corrupto ('?????', letras comidas).
+            _release_modifiers()
+            time.sleep(0.06)
             type_text_unicode(texto)
         except Exception as e:
             print(f"[MicDictado] error procesando audio: {e}")
