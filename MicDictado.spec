@@ -30,13 +30,29 @@ try:
 except Exception:
     llm_datas, llm_binaries, llm_hidden = [], [], []
 
+# DLLs CUDA: nvidia-cublas-cu12 / nvidia-cudnn-cu12 / nvidia-cuda-nvrtc-cu12.
+# En dev las carga cuda_dlls.py via os.add_dll_directory() apuntando a
+# site-packages\nvidia\<pkg>\bin\. En el .exe ese path no existe, asi que
+# hay que empaquetar las DLLs y replicarlas adentro del bundle, manteniendo
+# la estructura nvidia/<pkg>/bin/ para que cuda_dlls.py las encuentre por
+# importlib.util.find_spec.
+cuda_datas, cuda_binaries, cuda_hidden = [], [], []
+for _pkg in ('cublas', 'cudnn', 'cuda_nvrtc'):
+    try:
+        _d, _b, _h = collect_all(f'nvidia.{_pkg}')
+        cuda_datas += _d
+        cuda_binaries += _b
+        cuda_hidden += _h
+    except Exception:
+        pass
+
 a = Analysis(
     ['mic_dictado.py'],
     pathex=[],
-    binaries=fw_binaries + ct_binaries + tk_binaries + sd_binaries + ort_binaries + llm_binaries,
-    datas=fw_datas + ct_datas + tk_datas + sd_datas + ort_datas + llm_datas,
+    binaries=fw_binaries + ct_binaries + tk_binaries + sd_binaries + ort_binaries + llm_binaries + cuda_binaries,
+    datas=fw_datas + ct_datas + tk_datas + sd_datas + ort_datas + llm_datas + cuda_datas,
     hiddenimports=(
-        fw_hidden + ct_hidden + tk_hidden + ort_hidden + llm_hidden
+        fw_hidden + ct_hidden + tk_hidden + ort_hidden + llm_hidden + cuda_hidden
         + ['ctranslate2', 'tokenizers', 'llama_cpp']
         # Backends de pystray para Windows
         + ['pystray._win32', 'pystray._base']
