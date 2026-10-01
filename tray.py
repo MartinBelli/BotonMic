@@ -120,7 +120,7 @@ class SettingsWindow(tk.Toplevel):
         self.lbl_vu = ttk.Label(f_vu, text=f"{self.var_vu.get():.1f}", width=4)
         self.lbl_vu.grid(row=0, column=2, padx=8)
         scale_vu = ttk.Scale(
-            f_vu, from_=1.0, to=15.0, orient="horizontal",
+            f_vu, from_=1.0, to=40.0, orient="horizontal",
             variable=self.var_vu, command=self._on_vu_change,
             length=240,
         )

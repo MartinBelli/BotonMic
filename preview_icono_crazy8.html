@@ -1,0 +1,424 @@
+<title>Crazy 8 — Mini ecualizador</title>
+<style>
+  /* Layout: grid de 8 conceptos chicos y rapidos para elegir direccion antes
+     de pulir uno solo. Todos comparten el mismo nivel de voz simulado. */
+  :root{
+    --bg:#eef0f2; --surface:#ffffff; --surface-border:#dcdfe3;
+    --text:#1b1d1f; --text-dim:#6b7076; --accent:#3f6fd1;
+    --green:#4ade80; --red:#d86666; --stage:#16181b; --disc:#2a2a2a; --mic:#b5b5b5;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#111316; --surface:#1a1d21; --surface-border:#2a2e33;
+      --text:#eef0f2; --text-dim:#9196a0; --accent:#7aa2f7; color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#111316; --surface:#1a1d21; --surface-border:#2a2e33;
+    --text:#eef0f2; --text-dim:#9196a0; --accent:#7aa2f7; color-scheme:dark;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-serif;
+    padding-inline:16px; padding-block:32px;
+    display:flex; flex-direction:column; align-items:center; gap:24px;
+  }
+  .wrap{ width:100%; max-width:860px; display:flex; flex-direction:column; gap:24px; }
+  header h1{ font-size:1.25rem; margin:0 0 4px; }
+  header p{ margin:0; color:var(--text-dim); font-size:.9rem; line-height:1.5; }
+
+  .controls{
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+    background:var(--surface); border:1px solid var(--surface-border);
+    border-radius:12px; padding:12px 16px;
+  }
+  label.switch{ display:flex; align-items:center; gap:8px; font-size:.86rem; color:var(--text-dim); cursor:pointer; }
+  label.switch input{ accent-color:var(--accent); }
+
+  .grid{
+    display:grid; grid-template-columns:repeat(4, 1fr); gap:14px;
+  }
+  @media (max-width:620px){ .grid{ grid-template-columns:repeat(2, 1fr); } }
+
+  .detail{
+    background:var(--surface); border:1px solid var(--surface-border);
+    border-radius:14px; padding:20px; display:flex; flex-direction:column; gap:14px;
+  }
+  .detail-title{ font-size:.95rem; font-weight:600; }
+  .detail-row{ display:flex; gap:32px; justify-content:center; flex-wrap:wrap; }
+  .detail-item{ display:flex; flex-direction:column; align-items:center; gap:10px; }
+  .detail-stage{
+    background:var(--stage); border-radius:16px; width:140px; height:140px;
+    display:flex; align-items:center; justify-content:center; overflow:hidden;
+  }
+  .detail-stage .icon-box{ transform:scale(2.2); }
+  .detail-item .name{ font-size:.82rem; font-weight:600; }
+  .detail-item .sub{ font-size:.75rem; color:var(--text-dim); text-align:center; }
+
+  .card{
+    background:var(--surface); border:1px solid var(--surface-border);
+    border-radius:14px; padding:16px 10px 12px; display:flex; flex-direction:column;
+    align-items:center; gap:10px;
+  }
+  .card .num{ font-size:.7rem; color:var(--text-dim); font-variant-numeric:tabular-nums; }
+  .card .name{ font-size:.8rem; font-weight:600; text-align:center; line-height:1.3; }
+
+  .stage-mini{
+    background:var(--stage); border-radius:12px; width:100%; height:84px;
+    display:flex; align-items:center; justify-content:center;
+  }
+
+  .icon-box{ position:relative; width:56px; height:56px; }
+  .icon-box .disc{
+    position:absolute; inset:16px; border-radius:50%; background:var(--disc);
+    display:flex; align-items:center; justify-content:center; color:var(--mic);
+    z-index:2;
+  }
+  .icon-box .disc svg{ width:18px; height:18px; }
+  .mic-svg{ fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Crazy 8 — Ronda 2: variaciones del mini ecualizador</h1>
+    <p>Tomando la opción 4 de la ronda anterior (el mic se convierte en un mini ecualizador) como punto de partida: 8 variaciones sobre esa misma idea. Mismo nivel de voz simulado y mismo mute en las 8.</p>
+  </header>
+
+  <div class="detail">
+    <div class="detail-title">Opción 4 en detalle — muteado vs. activo, lado a lado y fijo en cada estado</div>
+    <div class="detail-row">
+      <div class="detail-item">
+        <div class="detail-stage"><div class="icon-box" id="detail-muted"></div></div>
+        <div class="name">Muteado</div>
+        <div class="sub">Mic en rojo, quieto. No hay stream abierto.</div>
+      </div>
+      <div class="detail-item">
+        <div class="detail-stage"><div class="icon-box" id="detail-quiet"></div></div>
+        <div class="name">Activo, sin hablar</div>
+        <div class="sub">Mic en gris, barras en 0.</div>
+      </div>
+      <div class="detail-item">
+        <div class="detail-stage"><div class="icon-box" id="detail-talking"></div></div>
+        <div class="name">Activo, hablando</div>
+        <div class="sub">Crossfade a barras verdes.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <label class="switch"><input type="checkbox" id="mute-toggle"> Muteado (los 8 de abajo)</label>
+  </div>
+
+  <div class="grid" id="grid"></div>
+</div>
+
+<script>
+const MIC_SVG = `<svg viewBox="0 0 24 24" class="mic-svg">
+  <rect x="9" y="2" width="6" height="11" rx="3"/>
+  <path d="M5 10v1a7 7 0 0 0 14 0v-1"/>
+  <line x1="12" y1="18" x2="12" y2="22"/>
+  <line x1="8" y1="22" x2="16" y2="22"/>
+</svg>`;
+
+function simulatedVoiceLevel(tSec){
+  const phrase = tSec % 4.2;
+  if (phrase > 2.6) return Math.random() * 0.04;
+  const envelope = Math.sin(phrase * 2.1) ** 2;
+  const jitter = (Math.sin(tSec * 17) * 0.5 + 0.5) * 0.25;
+  return Math.min(1, envelope * 0.8 + jitter);
+}
+
+const CONCEPTS = [
+  { name: "3 barras (la opción elegida)", build: buildBars3 },
+  { name: "5 barras finas, estilo pastilla", build: buildBars5Thin },
+  { name: "Mic fijo + barritas debajo", build: buildMicPlusMiniBars },
+  { name: "Crossfade suave mic ↔ barras", build: buildCrossfade },
+  { name: "Barras radiales (sunburst)", build: buildRadialBars },
+  { name: "Sparkline continuo", build: buildSparkline },
+  { name: "Barras ancladas abajo (Winamp)", build: buildBottomAnchored },
+  { name: "Mic + un solo latido central", build: buildSingleHeartbeat },
+];
+
+const gridEl = document.getElementById("grid");
+const muteEl = document.getElementById("mute-toggle");
+const updaters = [];
+
+// ── Detalle fijo: opcion 4 en sus 3 estados, uno al lado del otro ──
+const detailMutedUpdate = buildCrossfade(document.getElementById("detail-muted"));
+const detailQuietUpdate = buildCrossfade(document.getElementById("detail-quiet"));
+const detailTalkingUpdate = buildCrossfade(document.getElementById("detail-talking"));
+
+CONCEPTS.forEach((c, i) => {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="num">${i + 1}</div>
+    <div class="stage-mini"><div class="icon-box" id="icon-${i}"></div></div>
+    <div class="name">${c.name}</div>
+  `;
+  gridEl.appendChild(card);
+  const box = card.querySelector(`#icon-${i}`);
+  updaters.push(c.build(box));
+});
+
+function baseDisc(){
+  const disc = document.createElement("div");
+  disc.className = "disc";
+  disc.innerHTML = MIC_SVG;
+  return disc;
+}
+
+// Helper comun: disco con dos capas superpuestas (mic / barras) que se
+// togglean con "display", para las variantes que hacen swap duro.
+function buildDiscWithLayers(box, barCount, barW, barGap, micSize){
+  const disc = document.createElement("div");
+  disc.className = "disc";
+  box.appendChild(disc);
+  const micLayer = document.createElement("div");
+  micLayer.style.cssText = `position:absolute;inset:0;display:flex;align-items:center;justify-content:center;`;
+  micLayer.innerHTML = MIC_SVG.replace('class="mic-svg"', `class="mic-svg" style="width:${micSize}px;height:${micSize}px;color:var(--mic)"`);
+  const eqLayer = document.createElement("div");
+  eqLayer.style.cssText = "position:absolute;inset:0;display:none;align-items:center;justify-content:center;gap:" + barGap + "px;";
+  const bars = [];
+  for (let i = 0; i < barCount; i++){
+    const b = document.createElement("div");
+    b.style.cssText = `width:${barW}px;height:3px;border-radius:${barW/2}px;background:var(--green);`;
+    eqLayer.appendChild(b);
+    bars.push(b);
+  }
+  disc.appendChild(micLayer);
+  disc.appendChild(eqLayer);
+  return { disc, micLayer, eqLayer, bars };
+}
+
+// 1. 3 barras centradas (la opcion elegida en la ronda 1, tal cual)
+function buildBars3(box){
+  const { micLayer, eqLayer, bars } = buildDiscWithLayers(box, 3, 3, 2, 18);
+  let levels = bars.map(() => 0);
+  return (level, muted, t) => {
+    if (muted){ micLayer.style.display = "flex"; eqLayer.style.display = "none"; return; }
+    const active = level > 0.04;
+    micLayer.style.display = active ? "none" : "flex";
+    eqLayer.style.display = active ? "flex" : "none";
+    bars.forEach((b, i) => {
+      const mod = 0.5 + 0.5 * Math.sin(t * (3 + i) * 2 * Math.PI + i);
+      const target = level * mod;
+      levels[i] += (target - levels[i]) * (target > levels[i] ? 0.6 : 0.2);
+      b.style.height = (4 + levels[i] * 12).toFixed(1) + "px";
+    });
+  };
+}
+
+// 2. 5 barras finas, mismas proporciones/familia que la pastilla de dictado
+function buildBars5Thin(box){
+  const { micLayer, eqLayer, bars } = buildDiscWithLayers(box, 5, 2, 1.5, 16);
+  let levels = bars.map(() => 0);
+  return (level, muted, t) => {
+    if (muted){ micLayer.style.display = "flex"; eqLayer.style.display = "none"; return; }
+    const active = level > 0.04;
+    micLayer.style.display = active ? "none" : "flex";
+    eqLayer.style.display = active ? "flex" : "none";
+    bars.forEach((b, i) => {
+      const freq = 1.4 + i * 0.35, phase = i * 1.1;
+      const mod = 0.55 + 0.45 * Math.sin(t * freq * 2 * Math.PI + phase);
+      const target = level * mod;
+      levels[i] += (target - levels[i]) * (target > levels[i] ? 0.55 : 0.16);
+      b.style.height = (3 + levels[i] * 11).toFixed(1) + "px";
+    });
+  };
+}
+
+// 3. El mic nunca desaparece: una fila de barritas chicas aparece debajo
+function buildMicPlusMiniBars(box){
+  const disc = document.createElement("div");
+  disc.className = "disc";
+  disc.style.flexDirection = "column";
+  disc.style.gap = "1px";
+  box.appendChild(disc);
+  const micWrap = document.createElement("div");
+  micWrap.innerHTML = MIC_SVG.replace('class="mic-svg"', 'class="mic-svg" style="width:14px;height:14px;color:var(--mic)"');
+  disc.appendChild(micWrap);
+  const miniRow = document.createElement("div");
+  miniRow.style.cssText = "display:flex;gap:1.5px;height:4px;align-items:flex-end;";
+  const bars = [];
+  for (let i = 0; i < 3; i++){
+    const b = document.createElement("div");
+    b.style.cssText = "width:2px;height:1px;border-radius:1px;background:var(--green);opacity:0;";
+    miniRow.appendChild(b);
+    bars.push(b);
+  }
+  disc.appendChild(miniRow);
+  let levels = bars.map(() => 0);
+  return (level, muted, t) => {
+    if (muted){ bars.forEach(b => b.style.opacity = "0"); return; }
+    bars.forEach((b, i) => {
+      const mod = 0.5 + 0.5 * Math.sin(t * (3 + i) * 2 * Math.PI + i);
+      const target = level * mod;
+      levels[i] += (target - levels[i]) * (target > levels[i] ? 0.6 : 0.2);
+      b.style.height = (1 + levels[i] * 3.5).toFixed(1) + "px";
+      b.style.opacity = levels[i] > 0.05 ? "1" : "0";
+    });
+  };
+}
+
+// 4. Transicion mic <-> barras con crossfade (opacity), no un corte duro.
+// El mic cambia de color segun el estado: gris = activo/en silencio,
+// rojo = muteado. Sin esto, muteado y "activo pero sin hablar" se verian
+// identicos (el bug que tenia antes).
+function buildCrossfade(box){
+  const { disc, micLayer, eqLayer, bars } = buildDiscWithLayers(box, 3, 3, 2, 18);
+  const micSvg = micLayer.querySelector("svg");
+  micLayer.style.display = "flex";
+  eqLayer.style.display = "flex";
+  micLayer.style.transition = "opacity .25s ease, color .15s ease";
+  eqLayer.style.transition = "opacity .25s ease";
+  micLayer.style.opacity = "1";
+  eqLayer.style.opacity = "0";
+  let levels = bars.map(() => 0);
+  let active = false;
+  return (level, muted, t) => {
+    if (muted){
+      micLayer.style.opacity = "1";
+      eqLayer.style.opacity = "0";
+      micSvg.style.color = "var(--red)";
+      return;
+    }
+    micSvg.style.color = "var(--mic)";
+    // Histeresis para que no titile justo en el umbral
+    if (!active && level > 0.08) active = true;
+    if (active && level < 0.03) active = false;
+    micLayer.style.opacity = active ? "0" : "1";
+    eqLayer.style.opacity = active ? "1" : "0";
+    bars.forEach((b, i) => {
+      const mod = 0.5 + 0.5 * Math.sin(t * (3 + i) * 2 * Math.PI + i);
+      const target = level * mod;
+      levels[i] += (target - levels[i]) * (target > levels[i] ? 0.6 : 0.2);
+      b.style.height = (4 + levels[i] * 12).toFixed(1) + "px";
+    });
+  };
+}
+
+// 5. Barras radiales tipo sunburst alrededor del disco (no verticales adentro)
+function buildRadialBars(box){
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "position:absolute;inset:0;";
+  const COUNT = 10;
+  const segs = [];
+  for (let i = 0; i < COUNT; i++){
+    const angle = (i / COUNT) * 360;
+    const seg = document.createElement("div");
+    seg.style.cssText = `position:absolute;left:50%;top:4px;width:2px;height:5px;border-radius:1px;background:var(--green);
+      transform-origin:50% 24px;transform:rotate(${angle}deg);`;
+    wrap.appendChild(seg);
+    segs.push({ el: seg, angle, phase: i * 0.6 });
+  }
+  box.appendChild(wrap);
+  box.appendChild(baseDisc());
+  return (level, muted, t) => {
+    segs.forEach(s => {
+      if (muted){ s.el.style.background = "var(--red)"; s.el.style.opacity = "0.4"; s.el.style.height = "5px"; return; }
+      const mod = 0.5 + 0.5 * Math.sin(t * 2.2 + s.phase);
+      const intensity = Math.max(0.15, level) * mod;
+      s.el.style.background = "var(--green)";
+      s.el.style.opacity = (0.3 + intensity * 0.7).toFixed(2);
+      s.el.style.height = (5 + intensity * 7).toFixed(1) + "px";
+    });
+  };
+}
+
+// 6. Sparkline continuo: una linea de onda en vez de barras discretas
+function buildSparkline(box){
+  const disc = document.createElement("div");
+  disc.className = "disc";
+  box.appendChild(disc);
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 20 12");
+  svg.setAttribute("width", "20");
+  svg.setAttribute("height", "12");
+  const path = document.createElementNS(ns, "polyline");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "var(--mic)");
+  path.setAttribute("stroke-width", "1.4");
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(path);
+  disc.appendChild(svg);
+  const N = 10;
+  let history = new Array(N).fill(0);
+  return (level, muted, t) => {
+    history.shift();
+    history.push(muted ? 0 : level);
+    const pts = history.map((v, i) => {
+      const x = (i / (N - 1)) * 20;
+      const y = 6 - v * 5 * Math.sin(i * 1.3 + t * 3); // variacion visual, no solo altura plana
+      return `${x.toFixed(1)},${Math.max(1, Math.min(11, 6 - v * 5)).toFixed(1)}`;
+    });
+    path.setAttribute("points", pts.join(" "));
+    path.setAttribute("stroke", muted ? "var(--red)" : (Math.max(...history) > 0.1 ? "var(--green)" : "var(--mic)"));
+  };
+}
+
+// 7. Barras ancladas abajo, alturas variadas (ecualizador clasico tipo Winamp)
+function buildBottomAnchored(box){
+  const { micLayer, eqLayer, bars } = buildDiscWithLayers(box, 4, 2.5, 1.5, 17);
+  eqLayer.style.alignItems = "flex-end";
+  bars.forEach((b, i) => { b.style.height = (3 + i % 2 * 2) + "px"; });
+  let levels = bars.map((_, i) => 0.15 + (i % 2) * 0.1);
+  return (level, muted, t) => {
+    if (muted){ micLayer.style.display = "flex"; eqLayer.style.display = "none"; return; }
+    const active = level > 0.04;
+    micLayer.style.display = active ? "none" : "flex";
+    eqLayer.style.display = active ? "flex" : "none";
+    bars.forEach((b, i) => {
+      const freq = 2.2 + i * 0.7, phase = i * 1.4;
+      const mod = 0.45 + 0.55 * Math.abs(Math.sin(t * freq * 2 * Math.PI + phase));
+      const target = Math.max(0.1, level) * mod;
+      levels[i] += (target - levels[i]) * (target > levels[i] ? 0.65 : 0.25);
+      b.style.height = (3 + levels[i] * 13).toFixed(1) + "px";
+    });
+  };
+}
+
+// 8. El mic se queda quieto; un unico "latido" central (una barra) marca nivel
+function buildSingleHeartbeat(box){
+  const disc = document.createElement("div");
+  disc.className = "disc";
+  box.appendChild(disc);
+  const micWrap = document.createElement("div");
+  micWrap.style.cssText = "position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:.55;";
+  micWrap.innerHTML = MIC_SVG.replace('class="mic-svg"', 'class="mic-svg" style="width:16px;height:16px;color:var(--mic)"');
+  const bar = document.createElement("div");
+  bar.style.cssText = "position:absolute;left:50%;top:50%;width:3px;border-radius:2px;background:var(--green);transform:translate(-50%,-50%);";
+  disc.appendChild(micWrap);
+  disc.appendChild(bar);
+  let g = 0;
+  return (level, muted, t) => {
+    if (muted){ bar.style.background = "var(--red)"; bar.style.height = "6px"; bar.style.opacity = "0.6"; return; }
+    g += (level - g) * (level > g ? 0.55 : 0.15);
+    bar.style.background = "var(--green)";
+    bar.style.height = (4 + g * 14).toFixed(1) + "px";
+    bar.style.opacity = (0.4 + g * 0.6).toFixed(2);
+  };
+}
+
+function tick(now){
+  const tSec = now / 1000;
+  const muted = muteEl.checked;
+  const level = muted ? 0 : simulatedVoiceLevel(tSec);
+  updaters.forEach(fn => fn(level, muted, tSec));
+
+  // Detalle: cada estado fijo, independiente del toggle de arriba.
+  detailMutedUpdate(0, true, tSec);
+  detailQuietUpdate(0, false, tSec);
+  // Nivel sostenido y por encima del umbral de activacion, para que se vea
+  // la transicion a barras sin parpadear hacia el mic en las pausas.
+  const talkingLevel = 0.55 + 0.35 * Math.sin(tSec * 1.6 * 2 * Math.PI);
+  detailTalkingUpdate(talkingLevel, false, tSec);
+
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>

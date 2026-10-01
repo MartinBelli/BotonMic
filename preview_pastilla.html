@@ -1,0 +1,552 @@
+<title>Pastilla MicDictado</title>
+<style>
+  /* Layout: pastilla centrada tipo overlay flotante de Windows, con un panel
+     de control debajo para manejar estado y nivel de voz simulado. */
+  :root{
+    --bg:#eef0f2;
+    --surface:#ffffff;
+    --surface-border:#dcdfe3;
+    --text:#1b1d1f;
+    --text-dim:#6b7076;
+    --accent:#3f6fd1;
+
+    --pill-bg:#1f1f1f;
+    --pill-text:#f2f2f2;
+    --pill-shadow:0 12px 28px rgba(20,20,25,.28), 0 2px 6px rgba(20,20,25,.18);
+
+    --idle:#3a3a3a;
+    --rec:#dc3232;
+    --trans:#f0a020;
+    --clean:#9b59b6;
+    --reproc:#c0461a;
+    --nomatch:#707070;
+    --load:#4080e0;
+    --bar-accent:#3fa861;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#111316;
+      --surface:#1a1d21;
+      --surface-border:#2a2e33;
+      --text:#eef0f2;
+      --text-dim:#9196a0;
+      --accent:#7aa2f7;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#111316;
+    --surface:#1a1d21;
+    --surface-border:#2a2e33;
+    --text:#eef0f2;
+    --text-dim:#9196a0;
+    --accent:#7aa2f7;
+    color-scheme: dark;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-serif;
+    padding-inline:16px;
+    padding-block:32px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:28px;
+  }
+
+  .wrap{ width:100%; max-width:640px; display:flex; flex-direction:column; gap:28px; }
+
+  header h1{ font-size:1.3rem; margin:0 0 4px; }
+  header p{ margin:0; color:var(--text-dim); font-size:.92rem; line-height:1.5; }
+
+  .stage{
+    background:
+      radial-gradient(60% 80% at 50% 0%, rgba(255,255,255,.05), transparent 70%),
+      repeating-linear-gradient(135deg, rgba(255,255,255,.025) 0 2px, transparent 2px 14px),
+      #16181b;
+    border-radius:16px;
+    padding:56px 20px 40px;
+    display:flex;
+    justify-content:center;
+    min-height:140px;
+  }
+
+  /* ── Pastilla ─────────────────────────────────────────────── */
+  .pill{
+    background:var(--pill-bg);
+    color:var(--pill-text);
+    border-radius:999px;
+    box-shadow:var(--pill-shadow);
+    height:52px;
+    padding:0 20px 0 14px;
+    display:flex;
+    align-items:center;
+    gap:14px;
+    font-size:14px;
+    font-weight:600;
+    white-space:nowrap;
+    width:min(340px, 100%);
+    /* La pastilla real corre con -alpha 0.85 en Tkinter (toda la ventana,
+       no solo el fondo): lo replicamos con opacity para que los colores se
+       vean tan "lavados" como en Windows real, no mas vivos de lo que van
+       a quedar. */
+    opacity:.85;
+  }
+  .dot-wrap{ position:relative; width:16px; height:16px; flex:none; display:flex; align-items:center; justify-content:center; }
+  .dot{ width:10px; height:10px; border-radius:50%; background:var(--idle); transition:background-color .15s ease; }
+  .halo{ position:absolute; inset:0; border-radius:50%; background:var(--rec); opacity:0; }
+
+  .label{ flex:1; color:var(--pill-text); opacity:.95; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  .label:empty::before{ content:"En reposo"; color:#8a8a8a; font-weight:500; }
+
+  .meter{ display:flex; align-items:center; gap:3px; height:24px; flex:none; }
+
+  /* Barras (diseno nuevo) */
+  .bar{
+    width:7px;
+    border-radius:3px;
+    background:var(--idle);
+    transition:background-color .2s ease;
+  }
+
+  /* LEDs (diseno anterior, para comparar) */
+  .led{
+    width:7px; height:10px; border-radius:2px;
+    background:#2d2d2d;
+  }
+
+  /* ── Panel de control ─────────────────────────────────────── */
+  .panel{
+    background:var(--surface);
+    border:1px solid var(--surface-border);
+    border-radius:14px;
+    padding:18px 20px 20px;
+    display:flex;
+    flex-direction:column;
+    gap:16px;
+  }
+  .row{ display:flex; flex-direction:column; gap:8px; }
+  .row-label{ font-size:.78rem; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:.04em; }
+
+  .chips{ display:flex; flex-wrap:wrap; gap:8px; }
+  .chip{
+    border:1px solid var(--surface-border);
+    background:transparent;
+    color:var(--text);
+    padding:7px 13px;
+    border-radius:999px;
+    font-size:.82rem;
+    cursor:pointer;
+    font-family:inherit;
+  }
+  .chip[aria-pressed="true"]{
+    background:var(--accent);
+    border-color:var(--accent);
+    color:#fff;
+  }
+
+  .toggle-row{ display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .segmented{ display:flex; border:1px solid var(--surface-border); border-radius:10px; overflow:hidden; }
+  .segmented button{
+    border:none; background:transparent; color:var(--text);
+    padding:8px 14px; font-size:.84rem; cursor:pointer; font-family:inherit;
+  }
+  .segmented button[aria-pressed="true"]{ background:var(--accent); color:#fff; }
+
+  .slider-row{ display:flex; align-items:center; gap:12px; }
+  .slider-row input[type="range"]{ flex:1; accent-color:var(--accent); }
+  .slider-row span{ font-variant-numeric:tabular-nums; width:34px; text-align:right; color:var(--text-dim); font-size:.84rem; }
+
+  label.switch{ display:flex; align-items:center; gap:8px; font-size:.84rem; color:var(--text-dim); cursor:pointer; }
+  label.switch input{ accent-color:var(--accent); }
+
+  .note{ font-size:.8rem; color:var(--text-dim); line-height:1.5; border-top:1px solid var(--surface-border); padding-top:14px; }
+
+  .swatches{ display:flex; gap:10px; flex-wrap:wrap; }
+  .swatch{
+    width:40px; height:40px; border-radius:10px; border:2px solid transparent;
+    cursor:pointer; padding:0;
+  }
+  .swatch[aria-pressed="true"]{ border-color:var(--text); }
+  .swatch-label{ font-size:.7rem; color:var(--text-dim); text-align:center; margin-top:4px; }
+  .swatch-item{ display:flex; flex-direction:column; align-items:center; gap:2px; }
+
+  /* ── Comparacion icono de bandeja ─────────────────────────── */
+  .icon-compare{ display:flex; gap:48px; justify-content:center; flex-wrap:wrap; }
+  .icon-demo{ display:flex; flex-direction:column; align-items:center; gap:10px; }
+  .icon-demo .caption{ font-size:.78rem; color:#9a9fa6; }
+
+  .icon-box{ position:relative; width:64px; height:64px; }
+  .icon-box .ring-layer, .icon-box .mask-layer, .icon-box .disc{
+    position:absolute; inset:0; border-radius:50%;
+  }
+  .icon-box .mask-layer{ inset:5px; background:#16181b; }
+  .icon-box .disc{
+    inset:16px;
+    background:#2a2a2a;
+    display:flex; align-items:center; justify-content:center;
+    color:#b5b5b5;
+    z-index:1;
+  }
+  .icon-box .disc svg{ width:20px; height:20px; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Preview de la pastilla — MicDictado</h1>
+    <p>Mockup animado para validar el rediseño antes de tocarlo en el código real (Tkinter + Pillow). Cambiá el estado y el nivel de voz para ver cómo reacciona.</p>
+  </header>
+
+  <div class="stage">
+    <div class="pill" id="pill">
+      <div class="dot-wrap">
+        <div class="halo" id="halo"></div>
+        <div class="dot" id="dot"></div>
+      </div>
+      <div class="label" id="label"></div>
+      <div class="meter" id="meter"></div>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="icon-compare">
+      <div class="icon-demo">
+        <div class="icon-box">
+          <div class="ring-layer" id="icon-old-ring"></div>
+          <div class="mask-layer"></div>
+          <div class="disc">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="11" rx="3"/>
+              <path d="M5 10v1a7 7 0 0 0 14 0v-1"/>
+              <line x1="12" y1="18" x2="12" y2="22"/>
+              <line x1="8" y1="22" x2="16" y2="22"/>
+            </svg>
+          </div>
+        </div>
+        <span class="caption">Antes — arco de progreso</span>
+      </div>
+      <div class="icon-demo">
+        <div class="icon-box">
+          <div class="ring-layer" id="icon-new-ring"></div>
+          <div class="mask-layer"></div>
+          <div class="disc">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="11" rx="3"/>
+              <path d="M5 10v1a7 7 0 0 0 14 0v-1"/>
+              <line x1="12" y1="18" x2="12" y2="22"/>
+              <line x1="8" y1="22" x2="16" y2="22"/>
+            </svg>
+          </div>
+        </div>
+        <span class="caption">Ahora — anillo que respira</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <div class="row-label">Ícono de bandeja</div>
+      <label class="switch">
+        <input type="checkbox" id="icon-mute-toggle">
+        Muteado
+      </label>
+    </div>
+
+    <div class="row">
+      <div class="row-label">Medidor</div>
+      <div class="toggle-row">
+        <div class="segmented" id="design-toggle">
+          <button type="button" data-design="bars" aria-pressed="true">Ondas (nuevo)</button>
+          <button type="button" data-design="leds" aria-pressed="false">LEDs (anterior)</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="row-label">Color de la onda (con la transparencia real de la pastilla)</div>
+      <div class="swatches" id="color-swatches"></div>
+    </div>
+
+    <div class="row">
+      <div class="row-label">Estado</div>
+      <div class="chips" id="state-chips"></div>
+    </div>
+
+    <div class="row">
+      <div class="row-label">Nivel de voz</div>
+      <label class="switch">
+        <input type="checkbox" id="auto-toggle" checked>
+        Simular voz automáticamente
+      </label>
+      <div class="slider-row">
+        <input type="range" id="level-slider" min="0" max="100" value="0" disabled>
+        <span id="level-value">0%</span>
+      </div>
+    </div>
+
+    <div class="note">
+      El fix del borde rosado en las esquinas redondeadas (mezcla de color por la técnica de transparencia de Windows) no se nota en este mockup web — los navegadores componen con alpha real, así que ese bug no existe acá. Es un fix aparte, a nivel del render de Tkinter.
+    </div>
+  </div>
+</div>
+
+<script>
+// Nivel de voz simulado: rafagas tipo habla, con pausas, no un seno puro.
+// Compartido entre la demo de la pastilla y la demo del icono de bandeja.
+function simulatedVoiceLevel(tSec){
+  const phrase = tSec % 4.2;
+  if (phrase > 2.6) return Math.random() * 0.04; // pausa entre frases
+  const envelope = Math.sin(phrase * 2.1) ** 2;
+  const jitter = (Math.sin(tSec * 17) * 0.5 + 0.5) * 0.25;
+  return Math.min(1, envelope * 0.8 + jitter);
+}
+
+(function(){
+  const STATES = {
+    idle:          { label:"", color:"var(--idle)" },
+    cargando:      { label:"Cargando modelo...", color:"var(--load)" },
+    grabando:      { label:"Grabando...", color:"var(--rec)" },
+    transcribiendo:{ label:"Transcribiendo...", color:"var(--trans)" },
+    limpiando:     { label:"Limpiando...", color:"var(--clean)" },
+    reprocesando:  { label:"Reprocesando...", color:"var(--reproc)" },
+    no_entendido:  { label:"Audio no entendido", color:"var(--nomatch)" },
+  };
+  const STATE_ORDER = ["idle","grabando","transcribiendo","limpiando","reprocesando","no_entendido","cargando"];
+
+  const BAR_COUNT = 5;
+  const LED_COUNT = 10;
+  const SMOOTH_UP = 0.45, SMOOTH_DOWN = 0.14;
+
+  const pillEl = document.getElementById("pill");
+  const dotEl = document.getElementById("dot");
+  const haloEl = document.getElementById("halo");
+  const labelEl = document.getElementById("label");
+  const meterEl = document.getElementById("meter");
+  const chipsEl = document.getElementById("state-chips");
+  const designToggleEl = document.getElementById("design-toggle");
+  const swatchesEl = document.getElementById("color-swatches");
+  const autoToggleEl = document.getElementById("auto-toggle");
+  const sliderEl = document.getElementById("level-slider");
+  const sliderValEl = document.getElementById("level-value");
+
+  let currentState = "grabando";
+  let design = "bars"; // "bars" | "leds"
+  let auto = true;
+  let manualLevel = 0; // 0..1
+  let barLevels = new Array(BAR_COUNT).fill(0);
+  let haloPhaseStart = performance.now();
+
+  // ── Construir chips de estado ─────────────────────────────
+  STATE_ORDER.forEach(key => {
+    const btn = document.createElement("button");
+    btn.className = "chip";
+    btn.type = "button";
+    btn.textContent = key === "idle" ? "En reposo" : STATES[key].label.replace(/\.\.\.$/, "");
+    btn.setAttribute("aria-pressed", key === currentState ? "true" : "false");
+    btn.addEventListener("click", () => {
+      currentState = key;
+      [...chipsEl.children].forEach(c => c.setAttribute("aria-pressed", c === btn ? "true" : "false"));
+      applyState();
+    });
+    chipsEl.appendChild(btn);
+  });
+
+  // ── Swatches de color (comparar con la transparencia real) ─
+  const GREEN_CANDIDATES = [
+    { name: "Actual",     hex: "#3fa861" },
+    { name: "Esmeralda",  hex: "#22c55e" },
+    { name: "Verde vivo", hex: "#4ade80" },
+    { name: "Lima",       hex: "#a3e635" },
+  ];
+  GREEN_CANDIDATES.forEach((c, i) => {
+    const item = document.createElement("div");
+    item.className = "swatch-item";
+    const btn = document.createElement("button");
+    btn.className = "swatch";
+    btn.type = "button";
+    btn.style.background = c.hex;
+    btn.setAttribute("aria-pressed", i === 1 ? "true" : "false");
+    btn.addEventListener("click", () => {
+      document.documentElement.style.setProperty("--bar-accent", c.hex);
+      [...swatchesEl.querySelectorAll(".swatch")].forEach(s => s.setAttribute("aria-pressed", s === btn ? "true" : "false"));
+    });
+    const label = document.createElement("span");
+    label.className = "swatch-label";
+    label.textContent = c.name;
+    item.appendChild(btn);
+    item.appendChild(label);
+    swatchesEl.appendChild(item);
+  });
+  // Arranca en "Esmeralda" (candidato recomendado), no en el actual
+  document.documentElement.style.setProperty("--bar-accent", GREEN_CANDIDATES[1].hex);
+
+  // ── Toggle de diseno del medidor ──────────────────────────
+  designToggleEl.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-design]");
+    if (!b) return;
+    design = b.dataset.design;
+    [...designToggleEl.children].forEach(c => c.setAttribute("aria-pressed", c === b ? "true" : "false"));
+    buildMeter();
+  });
+
+  autoToggleEl.addEventListener("change", () => {
+    auto = autoToggleEl.checked;
+    sliderEl.disabled = auto;
+  });
+
+  sliderEl.addEventListener("input", () => {
+    manualLevel = Number(sliderEl.value) / 100;
+    sliderValEl.textContent = sliderEl.value + "%";
+  });
+
+  function applyState(){
+    const s = STATES[currentState];
+    labelEl.textContent = s.label;
+    dotEl.style.background = s.color;
+    haloEl.style.background = s.color;
+  }
+
+  function buildMeter(){
+    meterEl.innerHTML = "";
+    const count = design === "bars" ? BAR_COUNT : LED_COUNT;
+    for (let i = 0; i < count; i++){
+      const el = document.createElement("div");
+      el.className = design === "bars" ? "bar" : "led";
+      meterEl.appendChild(el);
+    }
+  }
+
+  function tick(now){
+    const tSec = now / 1000;
+    const recording = currentState === "grabando";
+
+    let level = 0;
+    if (recording) level = auto ? simulatedVoiceLevel(tSec) : manualLevel;
+
+    // Halo pulsante (solo grabando), igual formula que el overlay real
+    if (recording){
+      const t = 0.5 + 0.5 * Math.sin((tSec - haloPhaseStart/1000) * 1.5 * 2 * Math.PI);
+      haloEl.style.opacity = String(0.20 + (0.60 - 0.20) * t);
+    } else {
+      haloEl.style.opacity = "0";
+    }
+
+    if (design === "bars"){
+      for (let i = 0; i < BAR_COUNT; i++){
+        const freq = 1.4 + i * 0.35;
+        const phase = i * 1.1;
+        const mod = 0.55 + 0.45 * Math.sin(tSec * freq * 2 * Math.PI + phase);
+        const target = recording ? level * mod : 0;
+        const rate = target > barLevels[i] ? SMOOTH_UP : SMOOTH_DOWN;
+        barLevels[i] += (target - barLevels[i]) * rate;
+
+        const bar = meterEl.children[i];
+        if (!bar) continue;
+        const h = 3 + (20 - 3) * barLevels[i];
+        bar.style.height = h.toFixed(1) + "px";
+        // La onda siempre es verde (independiente del color del estado, que
+        // sigue marcando el punto/halo): asi se lee como "nivel de mic" y no
+        // se confunde con el semaforo de estado.
+        const colorVar = recording ? "var(--bar-accent)" : "var(--idle)";
+        bar.style.background = mixWithIdle(colorVar, recording ? Math.max(0.18, barLevels[i]) : 0.18);
+      }
+    } else {
+      const activeLevel = recording ? level : 0;
+      for (let i = 0; i < LED_COUNT; i++){
+        const led = meterEl.children[i];
+        if (!led) continue;
+        const on = activeLevel >= (i + 1) / LED_COUNT;
+        led.style.background = on ? ledColor(i) : "#2d2d2d";
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  function ledColor(i){
+    if (i < 4) return "#28be5c";
+    if (i < 7) return "#f0c020";
+    return "#dc3232";
+  }
+
+  // Mezcla aproximada entre gris apagado y el color de acento segun intensidad,
+  // resuelta en runtime via un elemento auxiliar (evita parsear var() a mano).
+  const mixProbe = document.createElement("div");
+  mixProbe.style.display = "none";
+  document.body.appendChild(mixProbe);
+  function mixWithIdle(colorVar, amount){
+    mixProbe.style.background = colorVar;
+    const resolved = getComputedStyle(mixProbe).backgroundColor; // "rgb(r, g, b)"
+    const m = resolved.match(/\d+/g).map(Number);
+    const idle = [58,58,58];
+    const t = Math.min(1, Math.max(0.18, amount));
+    const r = Math.round(idle[0] + (m[0]-idle[0]) * t);
+    const g = Math.round(idle[1] + (m[1]-idle[1]) * t);
+    const b = Math.round(idle[2] + (m[2]-idle[2]) * t);
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+
+  buildMeter();
+  applyState();
+  requestAnimationFrame(tick);
+})();
+
+// ── Demo del icono de bandeja: arco de progreso (antes) vs anillo que
+// respira (ahora). Ambos reaccionan al mismo nivel de voz simulado.
+(function(){
+  const oldRing = document.getElementById("icon-old-ring");
+  const newRing = document.getElementById("icon-new-ring");
+  const muteToggle = document.getElementById("icon-mute-toggle");
+
+  const GREEN_BASE = "159,217,177";   // pastel, igual espiritu que mic_tray.py
+  const GREEN_FILL = "63,168,97";
+  const RED = "216,102,102";
+
+  let ringGlow = 0; // suavizado del brillo por voz, persiste entre frames
+
+  function tick(now){
+    const tSec = now / 1000;
+    const muted = muteToggle.checked;
+    const level = muted ? 0 : simulatedVoiceLevel(tSec);
+
+    // ── Antes: arco conico de 300 grados (7 a 5, hueco abajo) ───
+    if (muted){
+      oldRing.style.background = `rgb(${RED})`;
+    } else {
+      const sweep = (level * 300).toFixed(1);
+      oldRing.style.background =
+        `conic-gradient(from 210deg, rgb(${GREEN_FILL}) 0deg, rgb(${GREEN_FILL}) ${sweep}deg, ` +
+        `rgb(${GREEN_BASE}) ${sweep}deg 300deg, transparent 300deg 360deg)`;
+    }
+
+    // ── Ahora: el anillo respira de verdad (escala), y la voz le suma
+    // brillo encima con ataque rapido / caida lenta ─────────────
+    if (muted){
+      newRing.style.transform = "scale(1)";
+      newRing.style.background = `rgb(${RED})`;
+      newRing.style.boxShadow = "none";
+    } else {
+      // Respiracion de base: oscilacion de TAMANIO bien visible, constante
+      // aunque no haya voz (asi se lee como "escuchando", no como decorativo).
+      // Anillo fino en reposo (ver mask-layer inset:5px): crece sin engordar.
+      const breathe = 0.5 + 0.5 * Math.sin(tSec * 0.9 * 2 * Math.PI);
+      const scale = 0.94 + breathe * 0.16; // 0.94 .. 1.10
+      newRing.style.transform = `scale(${scale.toFixed(3)})`;
+
+      // Brillo por voz: sube rapido al hablar, baja despacio (se nota el pico).
+      const rate = level > ringGlow ? 0.5 : 0.08;
+      ringGlow += (level - ringGlow) * rate;
+      const alpha = (0.35 + ringGlow * 0.65).toFixed(2);
+      const spread = (1 + ringGlow * 6).toFixed(1);
+      newRing.style.background = `rgb(${GREEN_BASE})`;
+      newRing.style.boxShadow = `0 0 ${spread}px 0 rgba(${GREEN_FILL}, ${alpha})`;
+    }
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>

@@ -1,11 +1,11 @@
 """
 mic_tray.py — Toggle de micrófono en la barra de tareas de Windows.
 
-Widget "circular" (transparentcolor) con disco gris, micrófono gris claro
-en el centro, y un arco de halo de las 7 a las 5 (pasando por arriba).
-Cuando el mic está activo el arco se pinta de verde claro; al hablar se
-sobrepinta con verde saturado creciendo de izquierda (7) a derecha (5),
-funcionando como VU meter angular. Muteado: arco en rojo tenue.
+Widget "circular" (transparentcolor) con disco gris y, en el centro, un
+icono de micrófono que se transforma con crossfade en un mini ecualizador
+de 3 barras verdes cuando detecta voz (con histéresis para no titilar en
+el umbral). Muteado: el icono de mic queda fijo en rojo, sin animación
+(no hay stream abierto mientras está muteado).
 
 Render con Pillow + supersampling 2x para antialiasing.
 
@@ -14,6 +14,7 @@ Requiere: pip install -r requirements.txt
 
 import atexit
 import ctypes
+import math
 import os
 import subprocess
 import sys
@@ -105,6 +106,12 @@ class _AudioMonitor:
     SENSITIVITY = 4.0
     WATCHDOG_INTERVAL_S = 2.0
     BACKOFF_MAX_S = 10.0
+    # Si no llega ni un callback de audio en este lapso, el stream se trata
+    # como muerto aunque PortAudio siga reportando .active=True. Esto cubre
+    # el caso real observado: el stream queda "activo" a nivel PortAudio pero
+    # deja de recibir datos (glitch silencioso del host de audio/USB), y sin
+    # este chequeo el watchdog nunca lo detecta.
+    STALE_CALLBACK_S = 5.0
 
     def __init__(self):
         self.level = 0.0
@@ -112,6 +119,8 @@ class _AudioMonitor:
         self._current_device = None
         self._shutdown = False
         self._backoff = 1.0
+        self._last_callback_ts = None
+        self._paused = False
 
         self._open()
         self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
@@ -119,6 +128,7 @@ class _AudioMonitor:
         atexit.register(self.close)
 
     def _callback(self, indata, frames, time_info, status):
+        self._last_callback_ts = time.time()
         try:
             rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
             self.level = min(rms * self.SENSITIVITY, 1.0)
@@ -142,6 +152,7 @@ class _AudioMonitor:
             stream.start()
             self._stream = stream
             self._current_device = device
+            self._last_callback_ts = time.time()
         except Exception as e:
             print(f"[AudioMonitor] no pude abrir stream: {e}")
             self._stream = None
@@ -155,11 +166,28 @@ class _AudioMonitor:
                 pass
             self._stream = None
 
+    def pause(self):
+        """Cierra el stream mientras el mic esta muteado: no tiene sentido
+        tenerlo abierto 24/7 si el nivel ni se muestra en ese estado, y
+        reduce la ventana de exposicion al bug del stream colgado."""
+        self._paused = True
+        self._close_stream()
+        self.level = 0.0
+
+    def resume(self):
+        """Reabre el stream al desmutear (stream fresco, sin arrastrar
+        ningun estado colgado de antes)."""
+        self._paused = False
+        if self._stream is None:
+            self._open()
+
     def _watchdog_loop(self):
         while not self._shutdown:
             time.sleep(self.WATCHDOG_INTERVAL_S)
             if self._shutdown:
                 return
+            if self._paused:
+                continue
             try:
                 needs_reopen = False
                 if self._stream is None:
@@ -169,6 +197,13 @@ class _AudioMonitor:
                         if not self._stream.active:
                             needs_reopen = True
                     except Exception:
+                        needs_reopen = True
+                    if (
+                        not needs_reopen
+                        and self._last_callback_ts is not None
+                        and time.time() - self._last_callback_ts > self.STALE_CALLBACK_S
+                    ):
+                        print("[AudioMonitor] stream activo pero sin callbacks recientes, reabriendo")
                         needs_reopen = True
                     try:
                         new_default = sd.default.device[0]
@@ -206,10 +241,9 @@ class MicToggle:
 
     # Paleta
     DISC_COLOR = "#2a2a2a"        # gris oscuro del disco
-    MIC_COLOR = "#b5b5b5"         # gris claro del icono mic
-    HALO_BASE_GREEN = "#9fd9b1"   # verde pastel claro (reposo)
-    HALO_FILL_GREEN = "#3fa861"   # verde saturado (hablando)
-    HALO_BASE_RED = "#d86666"     # rojo tenue (muteado)
+    MIC_COLOR = "#b5b5b5"         # gris claro del icono mic (activo, en silencio)
+    EQ_GREEN = "#4ade80"          # verde de las barras (mismo que la pastilla de dictado)
+    MUTED_RED = "#d86666"         # rojo del icono mic cuando esta muteado
 
     # Proporciones del render (en unidades del supersample). Se calculan
     # relativas al alto del widget (que coincide con el taskbar) al inicializar.
@@ -219,15 +253,31 @@ class MicToggle:
     TICK_MS = 40
     MUTE_CHECK_EVERY = 12  # 12 * 40ms = 480ms
 
-    # Arco del halo: convención PIL (0° = 3 en reloj, CW+).
-    # 7 en reloj = 120° PIL, 5 = 60° PIL. De 7 a 5 pasando por arriba = 300°.
-    HALO_START = 120
-    HALO_EXTENT = 300
+    # El mic se transforma en un mini ecualizador de 3 barras cuando detecta
+    # voz, con crossfade de opacidad (no un corte duro). Histeresis en los
+    # umbrales para que no titile justo en el borde.
+    EQ_BAR_COUNT = 3
+    EQ_ACTIVATE_LEVEL = 0.08
+    EQ_DEACTIVATE_LEVEL = 0.03
+    EQ_CROSSFADE_RATE = 0.25
+    EQ_BAR_SMOOTH_UP = 0.6
+    EQ_BAR_SMOOTH_DOWN = 0.2
+    # Geometria de las barras en unidades base-48 (mismo sistema que el
+    # icono del mic: se escalan con self._mic_scale).
+    EQ_BAR_W = 3
+    EQ_BAR_GAP = 2
+    EQ_BAR_MIN_H = 3
+    EQ_BAR_MAX_H = 12
 
     def __init__(self):
         self.volume = get_mic_volume()
         self.muted = bool(self.volume.GetMute())
         self.monitor = _AudioMonitor()
+        if self.muted:
+            self.monitor.pause()
+        self._eq_active = False
+        self._crossfade = 0.0  # 0 = mic, 1 = barras
+        self._bar_levels = [0.0] * self.EQ_BAR_COUNT
 
         self.root = tk.Tk()
         self.root.title("Mic")
@@ -250,10 +300,7 @@ class MicToggle:
 
         # Proporciones relativas al alto del widget
         self._disc_radius = int(w * 0.26)          # ~12 px si w=48
-        self._halo_inner_r = self._disc_radius + max(2, int(w * 0.06))
-        self._halo_width = max(4, int(w * 0.11))   # grosor del arco
-        self._halo_outer_r = self._halo_inner_r + self._halo_width
-        self._mic_scale = w / 48.0                  # para escalar el mic
+        self._mic_scale = w / 48.0                  # para escalar el mic y las barras
 
         self.canvas = tk.Canvas(
             self.root, width=w, height=h,
@@ -295,117 +342,50 @@ class MicToggle:
         return min(1.0, raw) ** 0.5
 
     def _render(self, level):
-        """Renderiza el halo+disco+mic a imagen con Pillow y la muestra."""
-        # Cache: solo re-renderizar si algo cambió significativamente
-        # (level redondeado a 0.02 + estado muted). Evita ~30 renders/seg inutiles.
-        key = (self.muted, round(level, 2))
-        if key == self._last_rendered_key:
-            return
-        self._last_rendered_key = key
+        """Renderiza disco + mic/ecualizador a imagen con Pillow y la muestra."""
+        # Cache: muteado es estatico (icono fijo, no hay stream abierto), asi
+        # que ahi si vale cachear por key. Activo siempre repinta: el
+        # crossfade y las barras animan todo el tiempo.
+        if self.muted:
+            key = (self.muted, round(level, 2))
+            if key == self._last_rendered_key:
+                return
+            self._last_rendered_key = key
+        else:
+            self._last_rendered_key = None
 
         SS = self.SUPERSAMPLE
         W = self._widget_size * SS
         H = self._widget_size * SS
 
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # transparente
-        draw = ImageDraw.Draw(img)
-
         cx = W // 2
         cy = H // 2
 
-        # ── Halo ──────────────────────────────────────────────
-        halo_outer_ss = self._halo_outer_r * SS
-        halo_inner_ss = self._halo_inner_r * SS
-        halo_center_r = (halo_outer_ss + halo_inner_ss) // 2
-        halo_w_ss = halo_outer_ss - halo_inner_ss
-
-        halo_bbox = (cx - halo_center_r, cy - halo_center_r,
-                     cx + halo_center_r, cy + halo_center_r)
-
-        if self.muted:
-            base_color = _hex_to_rgb(self.HALO_BASE_RED)
-            # En muted, el halo es tenue constante (sin fill).
-            draw.arc(
-                halo_bbox,
-                start=self.HALO_START,
-                end=self.HALO_START + self.HALO_EXTENT,
-                fill=base_color,
-                width=halo_w_ss,
-            )
-        else:
-            base_color = _hex_to_rgb(self.HALO_BASE_GREEN)
-            fill_color = _hex_to_rgb(self.HALO_FILL_GREEN)
-
-            # Capa base: arco completo verde claro
-            draw.arc(
-                halo_bbox,
-                start=self.HALO_START,
-                end=self.HALO_START + self.HALO_EXTENT,
-                fill=base_color,
-                width=halo_w_ss,
-            )
-
-            # Capa fill: arco verde saturado que crece de 7 a 5 con el nivel
-            if level > 0.01:
-                fill_end = self.HALO_START + self.HALO_EXTENT * min(1.0, level)
-                draw.arc(
-                    halo_bbox,
-                    start=self.HALO_START,
-                    end=fill_end,
-                    fill=fill_color,
-                    width=halo_w_ss,
-                )
-
         # ── Disco ──────────────────────────────────────────────
+        draw = ImageDraw.Draw(img)
         r_disc = self._disc_radius * SS
         draw.ellipse(
             (cx - r_disc, cy - r_disc, cx + r_disc, cy + r_disc),
             fill=_hex_to_rgb(self.DISC_COLOR),
         )
 
-        # ── Icono del mic (mas chico, centrado en el disco) ────
-        mc = _hex_to_rgb(self.MIC_COLOR)
-        s = self._mic_scale * SS  # factor escala
+        # ── Mic / mini ecualizador con crossfade de opacidad ────
+        # Modo "RGBA" explicito: con el modo por defecto, ImageDraw
+        # reemplaza el pixel en vez de componer el alpha, y el fundido no
+        # se veria (todo quedaria 100% opaco u oculto, sin transicion).
+        draw = ImageDraw.Draw(img, "RGBA")
+        s = self._mic_scale * SS  # mismo factor de escala para mic y barras
 
-        cap_w = int(6 * s)
-        cap_h = int(11 * s)
-        cap_top = cy - int(7 * s)
-        cap_bot = cap_top + cap_h
-        cap_left = cx - cap_w // 2
-        cap_right = cx + cap_w // 2
-
-        # Cápsula redondeada (cuerpo del mic)
-        try:
-            draw.rounded_rectangle(
-                (cap_left, cap_top, cap_right, cap_bot),
-                radius=cap_w // 2,
-                fill=mc,
-            )
-        except AttributeError:
-            # Fallback a rectangle si Pillow viejo
-            draw.rectangle((cap_left, cap_top, cap_right, cap_bot), fill=mc)
-
-        # Soporte en U debajo del cuerpo
-        u_w = int(12 * s)
-        u_h = int(8 * s)
-        u_top = cap_bot - int(2 * s)
-        u_bbox = (cx - u_w // 2, u_top, cx + u_w // 2, u_top + u_h)
-        u_line = max(1, int(1.8 * s))
-        # En PIL: start=0, end=180 traza desde 3 CW hasta 9 pasando por 6 (abajo) = U abierta hacia arriba
-        draw.arc(u_bbox, start=0, end=180, fill=mc, width=u_line)
-
-        # Pie del mic
-        stand_top = u_top + u_h // 2 + int(1 * s)
-        stand_bot = stand_top + int(3 * s)
-        stand_line = max(1, int(1.8 * s))
-        draw.line([(cx, stand_top), (cx, stand_bot)], fill=mc, width=stand_line)
-
-        # Base del pie
-        base_half = int(4 * s)
-        draw.line(
-            [(cx - base_half, stand_bot), (cx + base_half, stand_bot)],
-            fill=mc, width=stand_line,
-        )
+        if self.muted:
+            self._draw_mic_icon(draw, cx, cy, s, _hex_to_rgb(self.MUTED_RED), 255)
+        else:
+            mic_alpha = round(255 * (1.0 - self._crossfade))
+            if mic_alpha > 0:
+                self._draw_mic_icon(draw, cx, cy, s, _hex_to_rgb(self.MIC_COLOR), mic_alpha)
+            bar_alpha = round(255 * self._crossfade)
+            if bar_alpha > 0:
+                self._draw_eq_bars(draw, cx, cy, s, bar_alpha)
 
         # ── Downscale con antialiasing ──────────────────────────
         img = img.resize((self._widget_size, self._widget_size), Image.LANCZOS)
@@ -414,8 +394,96 @@ class MicToggle:
         self._photo = ImageTk.PhotoImage(img)
         self.canvas.itemconfig(self._canvas_image, image=self._photo)
 
+    def _draw_mic_icon(self, draw, cx, cy, s, color, alpha):
+        """Dibuja el icono de microfono (capsula + soporte en U + pie)."""
+        fill = (*color, alpha)
+
+        cap_w = int(6 * s)
+        cap_h = int(11 * s)
+        cap_top = cy - int(7 * s)
+        cap_bot = cap_top + cap_h
+        cap_left = cx - cap_w // 2
+        cap_right = cx + cap_w // 2
+
+        try:
+            draw.rounded_rectangle(
+                (cap_left, cap_top, cap_right, cap_bot),
+                radius=cap_w // 2,
+                fill=fill,
+            )
+        except AttributeError:
+            # Fallback a rectangle si Pillow viejo
+            draw.rectangle((cap_left, cap_top, cap_right, cap_bot), fill=fill)
+
+        u_w = int(12 * s)
+        u_h = int(8 * s)
+        u_top = cap_bot - int(2 * s)
+        u_bbox = (cx - u_w // 2, u_top, cx + u_w // 2, u_top + u_h)
+        u_line = max(1, int(1.8 * s))
+        # En PIL: start=0, end=180 traza desde 3 CW hasta 9 pasando por 6 (abajo) = U abierta hacia arriba
+        draw.arc(u_bbox, start=0, end=180, fill=fill, width=u_line)
+
+        stand_top = u_top + u_h // 2 + int(1 * s)
+        stand_bot = stand_top + int(3 * s)
+        stand_line = max(1, int(1.8 * s))
+        draw.line([(cx, stand_top), (cx, stand_bot)], fill=fill, width=stand_line)
+
+        base_half = int(4 * s)
+        draw.line(
+            [(cx - base_half, stand_bot), (cx + base_half, stand_bot)],
+            fill=fill, width=stand_line,
+        )
+
+    def _draw_eq_bars(self, draw, cx, cy, s, alpha):
+        """Dibuja las barras del mini ecualizador, centradas en el disco."""
+        accent = _hex_to_rgb(self.EQ_GREEN)
+        fill = (*accent, alpha)
+        bar_w = self.EQ_BAR_W * s
+        gap = self.EQ_BAR_GAP * s
+        total_w = self.EQ_BAR_COUNT * bar_w + (self.EQ_BAR_COUNT - 1) * gap
+        x0 = cx - total_w / 2
+        min_h = self.EQ_BAR_MIN_H * s
+        max_h = self.EQ_BAR_MAX_H * s
+        radius = max(1, bar_w / 2)
+
+        for i, lvl in enumerate(self._bar_levels):
+            lvl = max(0.0, min(1.0, lvl))
+            x_left = x0 + i * (bar_w + gap)
+            x_right = x_left + bar_w
+            h = min_h + (max_h - min_h) * lvl
+            draw.rounded_rectangle(
+                (x_left, cy - h / 2, x_right, cy + h / 2),
+                radius=radius,
+                fill=fill,
+            )
+
     def _tick(self):
         display = self._current_display_level()
+
+        # Histeresis: activa el ecualizador por encima de un umbral, lo
+        # desactiva por debajo de uno mas bajo, asi no titila en el borde.
+        if self.muted:
+            self._eq_active = False
+        elif not self._eq_active and display > self.EQ_ACTIVATE_LEVEL:
+            self._eq_active = True
+        elif self._eq_active and display < self.EQ_DEACTIVATE_LEVEL:
+            self._eq_active = False
+
+        # Crossfade suavizado hacia 0 (mic) o 1 (barras), no un corte duro.
+        target_fade = 1.0 if self._eq_active else 0.0
+        self._crossfade += (target_fade - self._crossfade) * self.EQ_CROSSFADE_RATE
+
+        # Nivel por barra, con modulacion propia para que no se muevan todas
+        # identicas (mismo patron que las barras de la pastilla de dictado).
+        t = time.time()
+        for i in range(self.EQ_BAR_COUNT):
+            freq = 3 + i
+            mod = 0.5 + 0.5 * math.sin(t * freq * 2 * math.pi + i)
+            target = display * mod if self._eq_active else 0.0
+            cur = self._bar_levels[i]
+            rate = self.EQ_BAR_SMOOTH_UP if target > cur else self.EQ_BAR_SMOOTH_DOWN
+            self._bar_levels[i] = cur + (target - cur) * rate
+
         self._render(display)
 
         self._tick_count += 1
@@ -431,6 +499,7 @@ class MicToggle:
                     real_muted = self.muted
             if real_muted != self.muted:
                 self.muted = real_muted
+                (self.monitor.pause() if real_muted else self.monitor.resume())
                 self._last_rendered_key = None  # forzar re-render
                 self._render(self._current_display_level())
 
@@ -449,6 +518,7 @@ class MicToggle:
             current = self.volume.GetMute()
             self.volume.SetMute(not current, None)
             self.muted = not current
+        (self.monitor.pause() if self.muted else self.monitor.resume())
         self._last_rendered_key = None
         self._render(self._current_display_level())
 

@@ -362,9 +362,10 @@ def _has_repetitive_loop(texto):
 class DictadoOverlay:
     """Overlay flotante con forma de pildora redondeada renderizada con Pillow.
 
-    Layout horizontal: dot de estado a la izq + etiqueta + 10 LEDs como VU meter
-    a la derecha. La pildora se logra con transparentcolor (los pixeles fuera del
-    rectangulo redondeado son del color magico que Tk vuelve transparente).
+    Layout horizontal: dot de estado a la izq + etiqueta + barras tipo onda de
+    audio (VU meter) a la derecha. La pildora se logra con transparentcolor:
+    el contenido se dibuja opaco sobre BG_PILL y se recorta con una mascara
+    aparte (ver _render) para que el borde no se mezcle con el color magico.
     """
 
     # ── Geometria ────────────────────────────────────────────────
@@ -382,13 +383,33 @@ class DictadoOverlay:
     LABEL_X = 32
     LABEL_FONT_SIZE = 11
 
-    LED_COUNT = 10
-    LED_X0 = 145          # primer LED empieza aqui
-    LED_W = 8
-    LED_GAP = 2
-    LED_Y0 = 11
-    LED_Y1 = 21
-    LED_RADIUS = 2        # esquinas redondeadas de cada segmento
+    # Barras tipo "onda de audio" (reemplazan las 10 LEDs semaforo).
+    BAR_COUNT = 5
+    BAR_X0 = 148          # primera barra empieza aqui
+    BAR_AREA_W = 92       # ancho total disponible para las barras
+    BAR_Y_CENTER = 16
+    BAR_MIN_H = 3         # altura en reposo (linea plana, "escuchando")
+    BAR_MAX_H = 20
+    BAR_RADIUS = 2
+    # Suavizado exponencial hacia el nivel objetivo: subir rapido (ataque),
+    # bajar mas lento (decay), asi se ve organico en vez de tembloroso.
+    BAR_SMOOTH_UP = 0.55
+    BAR_SMOOTH_DOWN = 0.16
+    # Mezcla con BG_PILL para la barra "en reposo" (silueta tenue, igual que
+    # antes hacian las LEDs apagadas)
+    BAR_OFF_MIX = 0.18
+    BAR_GAP = 4
+    # Verde fijo: la onda marca nivel de mic, no estado (el dot/halo ya
+    # marcan el estado con su propio color). Mas vivo que un verde medio
+    # porque la pildora corre con -alpha 0.85: un verde apagado se lava
+    # todavia mas con la transparencia y casi no se ve.
+    BAR_COLOR = "#4ade80"
+    # Modulacion por barra: cada una oscila con su propia frecuencia/fase
+    # sobre el nivel real, para que el conjunto se vea organico en vez de
+    # que las 5 barras se muevan identicas en bloque.
+    BAR_FREQ_BASE = 1.4
+    BAR_FREQ_STEP = 0.35
+    BAR_PHASE_STEP = 1.1
 
     # ── Colores ──────────────────────────────────────────────────
     BG_PILL = "#1f1f1f"
@@ -403,12 +424,6 @@ class DictadoOverlay:
     COLOR_CLEAN = "#9b59b6"  # violeta: estado limpiando (LLM corrigiendo texto)
     COLOR_REPROC = "#c0461a"   # naranja oscuro: reprocesando (loop detectado)
     COLOR_NOMATCH = "#707070"  # gris: audio no entendido (segundo intento tambien loopeo)
-
-    LED_GREEN = "#28be5c"
-    LED_YELLOW = "#f0c020"
-    LED_RED = "#dc3232"
-    # Mezcla LED-color con BG_PILL al 18% para "LED apagado pero presente"
-    LED_OFF_MIX = 0.18
 
     HALO_FREQ_HZ = 1.5
     HALO_ALPHA_MIN = 0.20
@@ -453,15 +468,14 @@ class DictadoOverlay:
         # Si falla, fallback al default de Pillow (mas feo pero no crashea).
         self._font = self._load_font(self.LABEL_FONT_SIZE * self.SUPERSAMPLE)
 
-        # Precomputar colores RGB y los "off" de cada LED
         self._bg_rgb = _hex_to_rgb(self.BG_PILL)
-        self._led_colors = self._precompute_led_colors()
 
         # Estado
         self._estado = "idle"
         self._level = 0.0
         self._level_source = None
         self._loop_running = False
+        self._bar_levels = [0.0] * self.BAR_COUNT
 
         # Win11: deiconify()/lift() activan la ventana (en Win10 no pasaba con
         # overrideredirect) -> el overlay robaba el foco y el SendInput tipeaba
@@ -498,22 +512,6 @@ class DictadoOverlay:
             except (OSError, IOError):
                 continue
         return ImageFont.load_default()
-
-    # ── Precompute LED colors ────────────────────────────────────
-
-    def _precompute_led_colors(self):
-        """Para cada uno de los 10 LEDs, precalcula color encendido y apagado."""
-        result = []
-        for i in range(self.LED_COUNT):
-            if i < 4:
-                on = _hex_to_rgb(self.LED_GREEN)
-            elif i < 7:
-                on = _hex_to_rgb(self.LED_YELLOW)
-            else:
-                on = _hex_to_rgb(self.LED_RED)
-            off = _lerp_rgb(self._bg_rgb, on, self.LED_OFF_MIX)
-            result.append((on, off))
-        return result
 
     # ── API publica ──────────────────────────────────────────────
 
@@ -561,47 +559,57 @@ class DictadoOverlay:
         else:
             self._level = 0.0
 
+        self._update_bar_levels()
         self._paint()
         self.root.after(self.REFRESH_MS, self._refresh_loop)
+
+    def _update_bar_levels(self):
+        """Suaviza cada barra hacia el nivel objetivo (ataque rapido, decay
+        lento) con una modulacion propia por barra, para que la onda se vea
+        organica en vez de que todas las barras midan exactamente lo mismo."""
+        recording = self._estado == "grabando"
+        t = time.time()
+        for i in range(self.BAR_COUNT):
+            freq = self.BAR_FREQ_BASE + i * self.BAR_FREQ_STEP
+            phase = i * self.BAR_PHASE_STEP
+            mod = 0.55 + 0.45 * math.sin(t * freq * 2 * math.pi + phase)
+            target = self._level * mod if recording else 0.0
+            current = self._bar_levels[i]
+            rate = self.BAR_SMOOTH_UP if target > current else self.BAR_SMOOTH_DOWN
+            self._bar_levels[i] = current + (target - current) * rate
 
     # ── Cache + paint ────────────────────────────────────────────
 
     def _paint(self):
-        """Renderiza si el cache key cambio. Llamado cada REFRESH_MS."""
-        # Bucket del nivel a 0.05 (20 niveles) -> evita repaints excesivos
-        level_bucket = round(min(1.0, max(0.0, self._level)) * 20)
-        # Bucket de la fase del halo: 16 buckets/ciclo, solo cuenta si grabando
+        """Renderiza si el cache key cambio. Llamado cada REFRESH_MS.
+
+        Mientras graba, la onda y el halo animan continuamente (su nivel
+        cambia aunque el estado no cambie), asi que ahi repintamos siempre."""
         if self._estado == "grabando":
-            halo_phase = (time.time() * self.HALO_FREQ_HZ) % 1.0
-            halo_bucket = round(halo_phase * 16) % 16
+            self._last_key = None
         else:
-            halo_phase = 0.0
-            halo_bucket = -1
+            key = (self._estado,)
+            if key == self._last_key:
+                return
+            self._last_key = key
 
-        key = (self._estado, level_bucket, halo_bucket)
-        if key == self._last_key:
-            return
-        self._last_key = key
-
-        img = self._render(self._level, halo_phase)
+        img = self._render()
         self._photo = ImageTk.PhotoImage(img)
         self.canvas.itemconfig(self._image_id, image=self._photo)
 
     # ── Render Pillow ────────────────────────────────────────────
 
-    def _render(self, level, halo_phase):
+    def _render(self):
         SS = self.SUPERSAMPLE
         W = self.WIDTH * SS
         H = self.HEIGHT * SS
         R = self.PILL_RADIUS * SS
 
-        # Fondo del canvas = transparent_key. Lo que dibujemos encima en BG_PILL
-        # u otro color sera lo unico visible.
-        img = Image.new("RGB", (W, H), self.TRANSPARENT_KEY)
+        # Contenido opaco sobre BG_PILL (sin el magenta de transparencia:
+        # ver mascara mas abajo). Todo lo que dibujamos queda adentro de la
+        # pildora, asi el color-key nunca se mezcla con el contenido.
+        img = Image.new("RGB", (W, H), self.BG_PILL)
         d = ImageDraw.Draw(img)
-
-        # ── Pildora (rect redondeado) ────────────────────────
-        d.rounded_rectangle((0, 0, W - 1, H - 1), radius=R, fill=self.BG_PILL)
 
         # ── Color y texto del estado ─────────────────────────
         state_color_hex, label_text = {
@@ -619,6 +627,7 @@ class DictadoOverlay:
         cy = self.DOT_CY * SS
         if self._estado == "grabando":
             # alpha visible oscila como semi-seno entre min y max
+            halo_phase = (time.time() * self.HALO_FREQ_HZ) % 1.0
             t = 0.5 + 0.5 * math.sin(halo_phase * 2 * math.pi)
             alpha = self.HALO_ALPHA_MIN + (self.HALO_ALPHA_MAX - self.HALO_ALPHA_MIN) * t
             halo_color = _lerp_rgb(self._bg_rgb, state_color, alpha)
@@ -639,27 +648,45 @@ class DictadoOverlay:
                 anchor="lm",
             )
 
-        # ── LEDs ─────────────────────────────────────────────
-        # Solo "vivos" en grabando; en otros estados los mostramos apagados (silueta)
-        active_level = level if self._estado == "grabando" else 0.0
-        for i, (on_color, off_color) in enumerate(self._led_colors):
-            x_left = (self.LED_X0 + i * (self.LED_W + self.LED_GAP)) * SS
-            x_right = x_left + self.LED_W * SS
-            y_top = self.LED_Y0 * SS
-            y_bot = self.LED_Y1 * SS
-            # Threshold: el LED i se enciende cuando level >= (i+1)/LED_COUNT
-            on = active_level >= (i + 1) / self.LED_COUNT
-            color = on_color if on else off_color
+        # ── Onda (barras) ──────────────────────────────────────
+        # Siempre verde: marca nivel de mic, no estado (eso ya lo dice el
+        # dot/halo). Se aclara de "apagado" a verde pleno segun el nivel de
+        # cada barra, asi la transicion se ve continua en vez de on/off.
+        bar_w = max(2.0, (self.BAR_AREA_W - (self.BAR_COUNT - 1) * self.BAR_GAP) / self.BAR_COUNT)
+        accent = _hex_to_rgb(self.BAR_COLOR)
+        off_color = _lerp_rgb(self._bg_rgb, accent, self.BAR_OFF_MIX)
+        for i, lvl in enumerate(self._bar_levels):
+            lvl = max(0.0, min(1.0, lvl))
+            x_left = (self.BAR_X0 + i * (bar_w + self.BAR_GAP)) * SS
+            x_right = x_left + bar_w * SS
+            h = (self.BAR_MIN_H + (self.BAR_MAX_H - self.BAR_MIN_H) * lvl) * SS
+            y_center = self.BAR_Y_CENTER * SS
+            color = _lerp_rgb(off_color, accent, lvl)
             d.rounded_rectangle(
-                (x_left, y_top, x_right, y_bot),
-                radius=self.LED_RADIUS * SS,
+                (x_left, y_center - h / 2, x_right, y_center + h / 2),
+                radius=self.BAR_RADIUS * SS,
                 fill=color,
             )
 
-        # Downscale con LANCZOS para AA limpio
+        # ── Mascara de la pildora ──────────────────────────────
+        # Recorte 100% opaco o 100% transparente, nunca un color intermedio:
+        # eso era lo que generaba el fleco rosado en las esquinas (el resize
+        # con antialiasing mezclaba BG_PILL con el magenta de transparencia,
+        # y esa mezcla ya no matcheaba el color clave exacto que Tk necesita
+        # para volverla invisible). Al separar mascara de contenido y
+        # umbralizarla DESPUES del downscale, el borde queda curvo (gracias al
+        # supersampling) pero cada pixel final es 100% uno u otro color.
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), radius=R, fill=255)
+
         if SS != 1:
             img = img.resize((self.WIDTH, self.HEIGHT), Image.LANCZOS)
-        return img
+            mask = mask.resize((self.WIDTH, self.HEIGHT), Image.LANCZOS)
+        mask = mask.point(lambda a: 255 if a > 127 else 0)
+
+        final = Image.new("RGB", (self.WIDTH, self.HEIGHT), self.TRANSPARENT_KEY)
+        final.paste(img, (0, 0), mask)
+        return final
 
 
 class MicDictado:
@@ -1066,11 +1093,17 @@ class MicDictado:
             self._audio_buffer.append(indata.copy())
 
         # Calcular RMS del chunk (normalizado int16 -> float [0,1]) para el VU meter.
-        # La ganancia es configurable (settings.vu_gain). Voz normal da RMS ~0.05-0.15;
-        # con default 7.0 la barra llega a verde alto sin gritar.
+        # La ganancia es configurable (settings.vu_gain). Despues de la ganancia
+        # aplicamos una curva de compresion (exponente < 1): el RMS real de voz
+        # hablando normal es chico (ordenes de 0.001-0.02 segun el gain de
+        # entrada del Focusrite), y una escala lineal necesita un gain enorme
+        # para que se note. La curva comprime el rango: empuja fuerte los
+        # valores chicos hacia arriba y satura mas suave arriba, como un VU
+        # meter perceptual en vez de uno lineal.
         chunk_f = indata.astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(chunk_f ** 2)))
-        self._current_level = min(rms * settings.vu_gain, 1.0)
+        raw = min(1.0, rms * settings.vu_gain)
+        self._current_level = raw ** 0.4
 
     def _start_recording(self):
         try:
@@ -1110,11 +1143,20 @@ class MicDictado:
 
     def _stop_recording(self):
         try:
-            # Cerrar stream
+            # Cerrar stream. Separamos stop/close y soltamos la referencia antes
+            # de intentar cada uno: si stop() tira una excepcion (glitch de WASAPI,
+            # device busy, etc.) igual queremos intentar close() y no dejar el
+            # handle de captura huerfano reteniendo el microfono para siempre.
             if self._stream is not None:
-                self._stream.stop()
-                self._stream.close()
-                self._stream = None
+                stream, self._stream = self._stream, None
+                try:
+                    stream.stop()
+                except Exception as e:
+                    print(f"[MicDictado] error en stream.stop(): {e}")
+                try:
+                    stream.close()
+                except Exception as e:
+                    print(f"[MicDictado] error en stream.close(): {e}")
 
             # Restaurar mute YA, antes de transcribir. La transcripcion no necesita
             # el mic abierto y el usuario espera que el mic vuelva a su estado

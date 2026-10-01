@@ -26,7 +26,7 @@ DEFAULT_INITIAL_PROMPT = (
 
 DEFAULTS = {
     # VU meter
-    "vu_gain": 7.0,                  # 1.0 - 15.0 (mas alto = mas sensible)
+    "vu_gain": 7.0,                  # 1.0 - 40.0 (mas alto = mas sensible)
 
     # Ducking de musica
     "ducking_enabled": True,
