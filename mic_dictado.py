@@ -359,6 +359,89 @@ def _has_repetitive_loop(texto):
     return False
 
 
+# ── Anti-alucinaciones de cola ("Gracias por ver el video") ─────
+# Whisper se entreno con subtitulos de YouTube: ante silencio/ruido al final
+# del audio "completa" con cierres tipicos. Tres defensas combinadas:
+#   1) recortar el silencio final antes de transcribir
+#   2) descartar el/los ultimos segmentos si su tramo de audio es casi silencio
+#   3) quitar frases de cierre tipicas al final del texto
+_FRAME_RMS_S = 0.03          # ventana de 30 ms para medir energia
+_PAD_COLA_S = 0.4            # silencio que se conserva tras la ultima voz
+_SEGS_FINALES_A_REVISAR = 2  # cuantos segmentos finales se revisan por energia
+
+_RE_CIERRES_ALUCINADOS = re.compile(
+    r"(?:[\s,.;:¡!¿?]*(?:"
+    r"gracias\s+por\s+(?:ver|mirar|vernos|escuchar)(?:\s+(?:el|este|la))?(?:\s+(?:v[ií]deo|canal|episodio))?"
+    r"|suscr[ií]be(?:te)?(?:\s+al\s+canal)?"
+    r"|subt[ií]tulos?\s+(?:realizados?\s+)?por\s+[^.!?]*"
+    r"|amara\.org[^.!?]*"
+    r"))+[\s.!?]*$",
+    re.IGNORECASE,
+)
+# 2+ 'gracias' seguidos al final: 'Gracias. Gracias. Gracias.' / '¡Gracias! ¡Gracias!'
+_RE_GRACIAS_REPETIDO = re.compile(
+    r"(?:[\s,.;:¡!¿?]*gracias){2,}[\s.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _rms_frames(audio_f32):
+    """RMS por ventana de 30 ms. Devuelve (rms_frames, tam_frame)."""
+    n = max(1, int(SAMPLE_RATE * _FRAME_RMS_S))
+    total = len(audio_f32) // n
+    if total == 0:
+        return np.array([], dtype=np.float32), n
+    frames = audio_f32[: total * n].reshape(total, n)
+    return np.sqrt(np.mean(frames * frames, axis=1)), n
+
+
+def _umbral_silencio(rms_frames):
+    """Umbral adaptativo: por encima del piso de ruido y de una fraccion del
+    nivel de voz (p95), con un minimo absoluto para mics muy limpios."""
+    piso = float(np.percentile(rms_frames, 10))
+    voz = float(np.percentile(rms_frames, 95))
+    return max(piso * 3.0, voz * 0.08, 0.002)
+
+
+def _recortar_silencio_final(audio_f32):
+    """Corta el silencio al final del audio (deja _PAD_COLA_S de colchon).
+    Si no hay voz clara o no hay nada que recortar, devuelve el audio igual."""
+    rms, n = _rms_frames(audio_f32)
+    if len(rms) < 4:
+        return audio_f32
+    umbral = _umbral_silencio(rms)
+    activos = np.nonzero(rms > umbral)[0]
+    if len(activos) == 0:
+        return audio_f32
+    fin = (int(activos[-1]) + 1) * n + int(_PAD_COLA_S * SAMPLE_RATE)
+    return audio_f32[:fin] if fin < len(audio_f32) else audio_f32
+
+
+def _segmento_es_silencio(audio_f32, start_s, end_s, umbral):
+    """True si la energia del tramo [start_s, end_s] del audio queda bajo el umbral."""
+    a = max(0, int(start_s * SAMPLE_RATE))
+    b = min(len(audio_f32), int(end_s * SAMPLE_RATE))
+    if b - a < int(0.05 * SAMPLE_RATE):
+        return False
+    tramo = audio_f32[a:b]
+    return float(np.sqrt(np.mean(tramo * tramo))) < umbral
+
+
+def _quitar_cierres_alucinados(texto):
+    """Quita al final del texto cierres tipicos alucinados por Whisper,
+    conservando la puntuacion de cierre de la frase real ('?', '!' o '.')."""
+    for regex in (_RE_CIERRES_ALUCINADOS, _RE_GRACIAS_REPETIDO):
+        m = regex.search(texto)
+        if not m:
+            continue
+        # La regex consume la puntuacion previa al cierre: la rescatamos
+        cierre = re.search(r"[.!?]", m.group(0))
+        texto = texto[: m.start()].rstrip()
+        if texto and texto[-1].isalnum():
+            texto += cierre.group(0) if cierre else "."
+    return texto.strip()
+
+
 class DictadoOverlay:
     """Overlay flotante con forma de pildora redondeada renderizada con Pillow.
 
@@ -1201,19 +1284,33 @@ class MicDictado:
         # Filtramos segmentos que el propio modelo marca como probable
         # silencio (no_speech_prob alto): son la fuente de las alucinaciones
         # tipo '…………' que turbo genera sobre pausas entre frases.
+        segs = [s for s in segments if s.text.strip()]
+        rms, _ = _rms_frames(audio_f32)
+        umbral = _umbral_silencio(rms) if len(rms) >= 4 else 0.0
+        primero_revisado = len(segs) - _SEGS_FINALES_A_REVISAR
         partes = []
-        for seg in segments:
+        for i, seg in enumerate(segs):
             txt = seg.text.strip()
-            if not txt:
-                continue
             if seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8:
                 print(
                     f"[MicDictado] segmento descartado (no_speech={seg.no_speech_prob:.2f}, "
                     f"logprob={seg.avg_logprob:.2f}): {txt!r}"
                 )
                 continue
+            # Los ultimos segmentos sobre audio casi silencioso son la fuente de
+            # 'Gracias por ver el video' (alta confianza, por eso no los frena
+            # el filtro de no_speech_prob).
+            if i >= primero_revisado and _segmento_es_silencio(
+                audio_f32, seg.start, seg.end, umbral
+            ):
+                print(f"[MicDictado] segmento final sobre silencio descartado: {txt!r}")
+                continue
             partes.append(txt)
         texto = _limpiar_alucinaciones(" ".join(partes))
+        antes = texto
+        texto = _quitar_cierres_alucinados(texto)
+        if texto != antes:
+            print(f"[MicDictado] cierre alucinado removido: {antes[len(texto):]!r}")
         return texto, time.time() - t0
 
     def _procesar_audio(self):
@@ -1240,6 +1337,8 @@ class MicDictado:
             audio_int16 = np.concatenate(chunks, axis=0).squeeze()
             duracion = len(audio_int16) / SAMPLE_RATE
             audio_f32 = audio_int16.astype(np.float32) / 32768.0
+            # Sin silencio de cola Whisper no tiene donde alucinar un cierre
+            audio_f32 = _recortar_silencio_final(audio_f32)
 
             if duracion < 0.3:
                 print(f"[MicDictado] audio muy corto ({duracion:.2f}s), descartando")
