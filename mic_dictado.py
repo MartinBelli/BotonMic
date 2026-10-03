@@ -368,6 +368,10 @@ def _has_repetitive_loop(texto):
 _FRAME_RMS_S = 0.03          # ventana de 30 ms para medir energia
 _PAD_COLA_S = 0.4            # silencio que se conserva tras la ultima voz
 _SEGS_FINALES_A_REVISAR = 2  # cuantos segmentos finales se revisan por energia
+# Fraccion del nivel de voz (p95 del RMS por frame) bajo la cual algo es "silencio".
+# Un segmento de voz normal ronda 0.5 x p95; la cola alucinada queda < 0.1 x p95.
+_RATIO_VOZ_RECORTE = 0.06    # por frame (recorte de cola)
+_RATIO_VOZ_SEGMENTO = 0.15   # por segmento completo
 
 _RE_CIERRES_ALUCINADOS = re.compile(
     r"(?:[\s,.;:¡!¿?]*(?:"
@@ -395,12 +399,14 @@ def _rms_frames(audio_f32):
     return np.sqrt(np.mean(frames * frames, axis=1)), n
 
 
-def _umbral_silencio(rms_frames):
-    """Umbral adaptativo: por encima del piso de ruido y de una fraccion del
-    nivel de voz (p95), con un minimo absoluto para mics muy limpios."""
+def _umbral_silencio(rms_frames, ratio_voz):
+    """Umbral adaptativo, siempre relativo al propio audio: el doble del piso
+    de ruido (p10) o una fraccion del nivel de voz (p95), el que sea mayor.
+    SIN piso absoluto: el mic del usuario es de muy bajo nivel (voz normal
+    ~0.002-0.004 de RMS) y cualquier minimo fijo clasifica voz como silencio."""
     piso = float(np.percentile(rms_frames, 10))
     voz = float(np.percentile(rms_frames, 95))
-    return max(piso * 3.0, voz * 0.08, 0.002)
+    return max(piso * 2.0, voz * ratio_voz, 1e-4)
 
 
 def _recortar_silencio_final(audio_f32):
@@ -409,7 +415,7 @@ def _recortar_silencio_final(audio_f32):
     rms, n = _rms_frames(audio_f32)
     if len(rms) < 4:
         return audio_f32
-    umbral = _umbral_silencio(rms)
+    umbral = _umbral_silencio(rms, _RATIO_VOZ_RECORTE)
     activos = np.nonzero(rms > umbral)[0]
     if len(activos) == 0:
         return audio_f32
@@ -1286,7 +1292,7 @@ class MicDictado:
         # tipo '…………' que turbo genera sobre pausas entre frases.
         segs = [s for s in segments if s.text.strip()]
         rms, _ = _rms_frames(audio_f32)
-        umbral = _umbral_silencio(rms) if len(rms) >= 4 else 0.0
+        umbral = _umbral_silencio(rms, _RATIO_VOZ_SEGMENTO) if len(rms) >= 4 else 0.0
         primero_revisado = len(segs) - _SEGS_FINALES_A_REVISAR
         partes = []
         for i, seg in enumerate(segs):
@@ -1300,7 +1306,9 @@ class MicDictado:
             # Los ultimos segmentos sobre audio casi silencioso son la fuente de
             # 'Gracias por ver el video' (alta confianza, por eso no los frena
             # el filtro de no_speech_prob).
-            if i >= primero_revisado and _segmento_es_silencio(
+            # Nunca se descarta el primer segmento util: un dictado corto no
+            # puede desaparecer por este filtro (solo recorta colas).
+            if partes and i >= primero_revisado and _segmento_es_silencio(
                 audio_f32, seg.start, seg.end, umbral
             ):
                 print(f"[MicDictado] segmento final sobre silencio descartado: {txt!r}")
@@ -1395,6 +1403,7 @@ class MicDictado:
             # el usuario solto el hotkey. Aca no hace falta tocarlo en el caso happy path.
 
             if not texto:
+                print("[MicDictado] transcripcion vacia tras filtros, nada que pegar")
                 return
 
             # Auto-pegado donde este el cursor (SendInput Unicode).
