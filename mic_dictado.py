@@ -1293,6 +1293,17 @@ class MicDictado:
         segs = [s for s in segments if s.text.strip()]
         rms, _ = _rms_frames(audio_f32)
         umbral = _umbral_silencio(rms, _RATIO_VOZ_SEGMENTO) if len(rms) >= 4 else 0.0
+        if len(rms) >= 4:
+            print(
+                f"[MicDictado] niveles RMS p10={np.percentile(rms, 10):.5f} "
+                f"p95={np.percentile(rms, 95):.5f} umbral_seg={umbral:.5f} "
+                f"vad={vad_filter} beam={beam_size} segmentos_crudos={len(segs)}"
+            )
+        for s_ in segs:
+            print(
+                f"[MicDictado]   seg {s_.start:.1f}-{s_.end:.1f}s "
+                f"no_speech={s_.no_speech_prob:.2f} logprob={s_.avg_logprob:.2f}: {s_.text.strip()!r}"
+            )
         primero_revisado = len(segs) - _SEGS_FINALES_A_REVISAR
         partes = []
         for i, seg in enumerate(segs):
@@ -1346,7 +1357,10 @@ class MicDictado:
             duracion = len(audio_int16) / SAMPLE_RATE
             audio_f32 = audio_int16.astype(np.float32) / 32768.0
             # Sin silencio de cola Whisper no tiene donde alucinar un cierre
+            n_orig = len(audio_f32)
             audio_f32 = _recortar_silencio_final(audio_f32)
+            if len(audio_f32) < n_orig:
+                print(f"[MicDictado] cola recortada: {n_orig / SAMPLE_RATE:.1f}s -> {len(audio_f32) / SAMPLE_RATE:.1f}s")
 
             if duracion < 0.3:
                 print(f"[MicDictado] audio muy corto ({duracion:.2f}s), descartando")
@@ -1418,6 +1432,7 @@ class MicDictado:
             _release_modifiers()
             time.sleep(0.06)
             type_text_unicode(texto)
+            print(f"[MicDictado] pegado enviado ({len(texto)} chars)")
         except Exception as e:
             print(f"[MicDictado] error procesando audio: {e}")
             import traceback
@@ -1436,7 +1451,51 @@ class MicDictado:
         self.overlay.root.mainloop()
 
 
+class _LogArchivo:
+    """Duplica stdout/stderr a un archivo (pythonw no tiene consola, y sin esto
+    los print de diagnostico se pierden). Cada linea lleva timestamp."""
+
+    def __init__(self, ruta, original):
+        self._f = open(ruta, "a", encoding="utf-8", buffering=1)
+        self._orig = original
+        self._inicio_linea = True
+
+    def write(self, texto):
+        if self._orig is not None:
+            try:
+                self._orig.write(texto)
+            except Exception:
+                pass
+        for parte in texto.splitlines(keepends=True):
+            if self._inicio_linea and parte.strip():
+                self._f.write(time.strftime("%H:%M:%S "))
+            self._f.write(parte)
+            self._inicio_linea = parte.endswith(chr(10))
+        return len(texto)
+
+    def flush(self):
+        try:
+            self._f.flush()
+        except Exception:
+            pass
+
+
+def _activar_log_archivo():
+    """Log en %LOCALAPPDATA%/MicDictado/mic_dictado.log (rota a .old si pasa 1 MB)."""
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        ruta = os.path.join(APP_DATA_DIR, "mic_dictado.log")
+        if os.path.exists(ruta) and os.path.getsize(ruta) > 1_000_000:
+            os.replace(ruta, ruta + ".old")
+        sys.stdout = _LogArchivo(ruta, sys.stdout)
+        sys.stderr = _LogArchivo(ruta, sys.stderr)
+        print(f"===== MicDictado arrancó {datetime.datetime.now().isoformat(timespec='seconds')} =====")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _activar_log_archivo()
     try:
         app = MicDictado()
 

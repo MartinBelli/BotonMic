@@ -75,6 +75,56 @@ def _cleanup_lockfile():
 _enforce_single_instance()
 
 
+# ── Log a archivo ────────────────────────────────────────────────
+# MicToggle corre como .exe sin consola: sin esto los print se pierden y no hay
+# forma de diagnosticar cuelgues del micrófono a posteriori.
+_LOG_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "MicDictado"
+)
+_LOG_FILE = os.path.join(_LOG_DIR, "mic_toggle.log")
+_log_lock = threading.Lock()
+
+
+def _log(msg):
+    """Appendea una linea con timestamp a mic_toggle.log. Nunca debe romper la app."""
+    try:
+        with _log_lock:
+            os.makedirs(_LOG_DIR, exist_ok=True)
+            if os.path.exists(_LOG_FILE) and os.path.getsize(_LOG_FILE) > 1_000_000:
+                os.replace(_LOG_FILE, _LOG_FILE + ".old")
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def _snapshot_eventos_windows():
+    """En un hilo aparte: vuelca al log los eventos de System/Audio de los
+    ultimos 10 minutos. Se dispara en el primer cuelgue detectado, para poder
+    cruzar el momento exacto con lo que vio Windows (reset USB, driver, etc.)."""
+    def _run():
+        ps = (
+            "$d=(Get-Date).AddMinutes(-10);"
+            "Get-WinEvent -FilterHashtable @{LogName='System';StartTime=$d} -ErrorAction SilentlyContinue |"
+            " Where-Object { $_.ProviderName -match 'USB|Kernel-PnP|Audio|Focusrite|Kernel-Power|WUDF|usbhub|usbccgp' } |"
+            " Select-Object -First 30 | ForEach-Object { '{0} {1} {2} {3}' -f $_.TimeCreated.ToString('HH:mm:ss'),$_.ProviderName,$_.Id,(($_.Message -split [char]10)[0]) };"
+            "Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Audio/Operational';StartTime=$d} -ErrorAction SilentlyContinue |"
+            " Select-Object -First 20 | ForEach-Object { 'AUDIO {0} {1} {2}' -f $_.TimeCreated.ToString('HH:mm:ss'),$_.Id,(($_.Message -split [char]10)[0]) }"
+        )
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=40,
+                creationflags=0x08000000, encoding="utf-8", errors="replace",
+            )
+            salida = (r.stdout or "").strip() or "(sin eventos relevantes en los ultimos 10 min)"
+            _log("[snapshot] eventos de Windows (ultimos 10 min):\n" + salida)
+        except Exception as e:
+            _log(f"[snapshot] no pude leer eventos de Windows: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def get_mic_volume():
     devices = AudioUtilities.GetMicrophone()
     if devices is None:
@@ -121,7 +171,14 @@ class _AudioMonitor:
         self._backoff = 1.0
         self._last_callback_ts = None
         self._paused = False
+        # Diagnostico de cuelgues: callbacks desde el ultimo open, y control
+        # para no spamear el log mientras el stream sigue muerto.
+        self._cb_count = 0
+        self._open_ts = None
+        self._stalled_since = None
+        self._last_stall_log = 0.0
 
+        _log("===== MicToggle arranco =====")
         self._open()
         self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watchdog_thread.start()
@@ -129,6 +186,14 @@ class _AudioMonitor:
 
     def _callback(self, indata, frames, time_info, status):
         self._last_callback_ts = time.time()
+        if self._cb_count == 0 and self._open_ts is not None:
+            _log(f"[stream] primer callback {self._last_callback_ts - self._open_ts:.2f}s despues de abrir")
+        self._cb_count += 1
+        if self._stalled_since is not None:
+            _log(f"[stream] RECUPERADO tras {self._last_callback_ts - self._stalled_since:.0f}s sin datos")
+            self._stalled_since = None
+        if status:
+            _log(f"[stream] status: {status}")
         try:
             rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
             self.level = min(rms * self.SENSITIVITY, 1.0)
@@ -149,16 +214,26 @@ class _AudioMonitor:
                 latency="low",
                 callback=self._callback,
             )
+            self._cb_count = 0
+            self._open_ts = time.time()
             stream.start()
             self._stream = stream
             self._current_device = device
             self._last_callback_ts = time.time()
+            try:
+                info = sd.query_devices(device)
+                api = sd.query_hostapis(info["hostapi"])["name"]
+                _log(f"[stream] abierto: [{device}] {info['name']} ({api}) sr={stream.samplerate}")
+            except Exception:
+                _log(f"[stream] abierto: device={device}")
         except Exception as e:
             print(f"[AudioMonitor] no pude abrir stream: {e}")
+            _log(f"[stream] ERROR al abrir: {e}")
             self._stream = None
 
     def _close_stream(self):
         if self._stream is not None:
+            _log(f"[stream] cerrando (callbacks recibidos: {self._cb_count})")
             try:
                 self._stream.stop()
                 self._stream.close()
@@ -171,6 +246,7 @@ class _AudioMonitor:
         tenerlo abierto 24/7 si el nivel ni se muestra en ese estado, y
         reduce la ventana de exposicion al bug del stream colgado."""
         self._paused = True
+        _log("[mute] MUTEADO -> pausando monitor")
         self._close_stream()
         self.level = 0.0
 
@@ -178,6 +254,7 @@ class _AudioMonitor:
         """Reabre el stream al desmutear (stream fresco, sin arrastrar
         ningun estado colgado de antes)."""
         self._paused = False
+        _log("[mute] ACTIVO -> reanudando monitor")
         if self._stream is None:
             self._open()
 
@@ -205,6 +282,23 @@ class _AudioMonitor:
                     ):
                         print("[AudioMonitor] stream activo pero sin callbacks recientes, reabriendo")
                         needs_reopen = True
+                        ahora = time.time()
+                        if self._stalled_since is None:
+                            # Primer aviso del episodio: contexto completo + snapshot de Windows
+                            self._stalled_since = self._last_callback_ts
+                            self._last_stall_log = ahora
+                            try:
+                                muteado = bool(get_mic_volume().GetMute())
+                            except Exception:
+                                muteado = "?"
+                            _log(
+                                f"[stream] CUELGUE detectado: {ahora - self._last_callback_ts:.0f}s sin callbacks "
+                                f"(callbacks desde el open: {self._cb_count}, mute_windows={muteado})"
+                            )
+                            _snapshot_eventos_windows()
+                        elif ahora - self._last_stall_log > 60:
+                            self._last_stall_log = ahora
+                            _log(f"[stream] sigue colgado: {ahora - self._stalled_since:.0f}s sin datos (reabriendo cada ~5s)")
                     try:
                         new_default = sd.default.device[0]
                         if new_default is not None and new_default != self._current_device:
@@ -498,6 +592,7 @@ class MicToggle:
                 except Exception:
                     real_muted = self.muted
             if real_muted != self.muted:
+                _log(f"[mute] cambio externo (MicDictado u otra app): ahora {'MUTEADO' if real_muted else 'ACTIVO'}")
                 self.muted = real_muted
                 (self.monitor.pause() if real_muted else self.monitor.resume())
                 self._last_rendered_key = None  # forzar re-render
@@ -518,6 +613,7 @@ class MicToggle:
             current = self.volume.GetMute()
             self.volume.SetMute(not current, None)
             self.muted = not current
+        _log(f"[mute] click del usuario: ahora {'MUTEADO' if self.muted else 'ACTIVO'}")
         (self.monitor.pause() if self.muted else self.monitor.resume())
         self._last_rendered_key = None
         self._render(self._current_display_level())
