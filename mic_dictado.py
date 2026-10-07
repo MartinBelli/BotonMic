@@ -382,9 +382,9 @@ _RE_CIERRES_ALUCINADOS = re.compile(
     r"))+[\s.!?]*$",
     re.IGNORECASE,
 )
-# 2+ 'gracias' seguidos al final: 'Gracias. Gracias. Gracias.' / '¡Gracias! ¡Gracias!'
+# 2+ despedidas seguidas al final: 'Gracias. Gracias.' / '¡Adiós! ¡Adiós!' / 'Chau, chau, chau'
 _RE_GRACIAS_REPETIDO = re.compile(
-    r"(?:[\s,.;:¡!¿?]*gracias){2,}[\s.!?]*$",
+    r"[\s,.;:¡!¿?]*(gracias|adi[oó]s|chau|bye)(?:[\s,.;:¡!¿?]+\1){1,}[\s.!?]*$",
     re.IGNORECASE,
 )
 
